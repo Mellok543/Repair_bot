@@ -60,6 +60,7 @@ sealed class BotApp
     };
 
     private const string ApiTemplate = "https://api.telegram.org/bot{0}/{1}";
+    private const string WelcomeMessage = "Уважаемые пользователи! Просим относиться к работе с ботом максимально ответственно: указывайте данные полно и точно, чтобы исключить недопонимание. Пожалуйста, всегда пишите точные названия прошивок и корректные частоты.";
 
     private readonly string _token;
     private readonly HttpClient _httpClient = new();
@@ -171,6 +172,11 @@ sealed class BotApp
 
                     var canComplete = _closerIds.Contains(userId);
                     var mainMenu = Keyboards.MainMenu(canComplete, canManageAccess, true);
+
+                    if (_accessStore.ConsumeWelcome(userId))
+                    {
+                        await SendMessageAsync(chatId, WelcomeMessage, mainMenu);
+                    }
 
                     if (text is "Отменить заявку" or "Назад")
                     {
@@ -1084,7 +1090,7 @@ sealed class SessionState(string step)
                 if (!ConsumablesUnits.Contains(text)) return "Выберите подразделение кнопкой: КТ / СТ / Мавики";
                 Data["consumables_unit"] = text;
                 Step = "consumables_needed";
-                return "Необходимо: (Ручной ввод)";
+                return "Что необходимо: (Пример: VTX 5.8ГГЦ)";
 
             case "consumables_needed":
                 if (string.IsNullOrWhiteSpace(text)) return "Введите, что необходимо:";
@@ -1940,7 +1946,7 @@ sealed class AccessStore
     private const string SheetName = "Users";
     private const string RecommendationSheetName = "Recommendations";
     private const string UsernameAccessSheetName = "UsernameAccess";
-    private static readonly string[] Headers = ["UserId", "DisplayName", "CanUseBot", "CanComplete", "CanManageAccess", "NotifyRequests", "NotifyRecommendations", "AddedAt", "Username"];
+    private static readonly string[] Headers = ["UserId", "DisplayName", "CanUseBot", "CanComplete", "CanManageAccess", "NotifyRequests", "NotifyRecommendations", "AddedAt", "Username", "WelcomeShown"];
     private static readonly string[] RecommendationHeaders = ["ID", "Дата", "Рекомендовал", "Кандидат Username", "Кандидат ID", "Комментарий", "Статус", "Проверено", "Кем проверено"];
     private static readonly string[] UsernameAccessHeaders = ["Username", "CanUseBot", "AddedAt"];
 
@@ -2010,6 +2016,31 @@ sealed class AccessStore
         }
     }
 
+    public bool ConsumeWelcome(long userId)
+    {
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            var ws = workbook.Worksheet(SheetName);
+            var row = FindOrCreateRow(ws, userId);
+
+            var shown = ws.Cell(row, 10).GetString() == "1";
+            if (shown)
+            {
+                return false;
+            }
+
+            ws.Cell(row, 10).Value = "1";
+            if (string.IsNullOrWhiteSpace(ws.Cell(row, 8).GetString()))
+            {
+                ws.Cell(row, 8).Value = DateTime.Now.ToString("s");
+            }
+
+            workbook.SaveAs(_excelPath);
+            return true;
+        }
+    }
+
     public void UpdateUserProfile(long userId, string? username, string displayName)
     {
         lock (_sync)
@@ -2030,6 +2061,11 @@ sealed class AccessStore
                 {
                     ws.Cell(row, 9).Value = normalized;
                 }
+            }
+
+            if (string.IsNullOrWhiteSpace(ws.Cell(row, 10).GetString()))
+            {
+                ws.Cell(row, 10).Value = "0";
             }
 
             workbook.SaveAs(_excelPath);
@@ -2055,6 +2091,7 @@ sealed class AccessStore
             if (notifyRequests.HasValue) ws.Cell(row, 6).Value = notifyRequests.Value ? "1" : "0";
             if (notifyRecommendations.HasValue) ws.Cell(row, 7).Value = notifyRecommendations.Value ? "1" : "0";
             if (string.IsNullOrWhiteSpace(ws.Cell(row, 8).GetString())) ws.Cell(row, 8).Value = DateTime.Now.ToString("s");
+            if (string.IsNullOrWhiteSpace(ws.Cell(row, 10).GetString())) ws.Cell(row, 10).Value = "0";
             if (string.IsNullOrWhiteSpace(ws.Cell(row, 2).GetString())) ws.Cell(row, 2).Value = "-";
 
             workbook.SaveAs(_excelPath);
