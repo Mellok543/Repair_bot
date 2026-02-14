@@ -39,15 +39,15 @@ sealed record AppSettings(
     HashSet<long> RecommendationNotificationUserIds)
 {
     public static AppSettings Default => new(
-        TablesDirectory: "/var/lib/repair_bot/excel",
+        TablesDirectory: "data",
         ExcelPath: "applications.xlsx",
         RepairExcelPath: "repairs.xlsx",
         ConsumablesExcelPath: "consumables.xlsx",
         AccessExcelPath: "access_users.xlsx",
-        CloserIds: [992964625, 7302929200, 191974662],
+        CloserIds: [992964625, 222222222],
         AccessAdminIds: [992964625],
-        AllowedUserIds: [992964625, 7302929200, 191974662],
-        NotificationUserIds: [992964625, 7302929200, 191974662],
+        AllowedUserIds: [992964625, 222222222],
+        NotificationUserIds: [992964625],
         RecommendationNotificationUserIds: [992964625]
     );
 }
