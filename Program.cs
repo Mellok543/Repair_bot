@@ -39,14 +39,14 @@ sealed record AppSettings(
     HashSet<long> RecommendationNotificationUserIds)
 {
     public static AppSettings Default => new(
-        TablesDirectory: "data",
+        TablesDirectory: "/var/lib/repair_bot/excel",
         ExcelPath: "applications.xlsx",
         RepairExcelPath: "repairs.xlsx",
         ConsumablesExcelPath: "consumables.xlsx",
         AccessExcelPath: "access_users.xlsx",
-        CloserIds: [992964625, 222222222],
+        CloserIds: [992964625],
         AccessAdminIds: [992964625],
-        AllowedUserIds: [992964625, 222222222],
+        AllowedUserIds: [992964625],
         NotificationUserIds: [992964625],
         RecommendationNotificationUserIds: [992964625]
     );
@@ -88,16 +88,18 @@ sealed class BotApp
         HashSet<long> recommendationNotificationUserIds)
     {
         _token = token;
-        _closerIds = closerIds;
-        _accessAdminIds = accessAdminIds;
+        _closerIds = closerIds ?? new();
+        _accessAdminIds = accessAdminIds ?? new();
         _store = new ApplicationStore(excelPath);
         _repairStore = new RepairStore(repairExcelPath);
         _consumablesStore = new ConsumablesStore(consumablesExcelPath);
         _accessStore = new AccessStore(accessExcelPath);
-        _notificationUserIds = notificationUserIds;
-        _recommendationNotificationUserIds = recommendationNotificationUserIds;
+        _allowedUserIds = new HashSet<long>();
+        _notificationUserIds = notificationUserIds ?? new();
+        _recommendationNotificationUserIds = recommendationNotificationUserIds ?? new();
 
-        _accessStore.Bootstrap(initialAllowedUserIds, closerIds, accessAdminIds, notificationUserIds, recommendationNotificationUserIds);
+        var allowedSeed = initialAllowedUserIds ?? new HashSet<long>();
+        _accessStore.Bootstrap(allowedSeed, _closerIds, _accessAdminIds, _notificationUserIds, _recommendationNotificationUserIds);
 
         foreach (var profile in _accessStore.GetUsers())
         {
