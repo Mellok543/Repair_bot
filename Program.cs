@@ -39,7 +39,7 @@ sealed record AppSettings(
     HashSet<long> RecommendationNotificationUserIds)
 {
     public static AppSettings Default => new(
-        TablesDirectory: "/var/lib/repair_bot/excel",
+        TablesDirectory: "data",
         ExcelPath: "applications.xlsx",
         RepairExcelPath: "repairs.xlsx",
         ConsumablesExcelPath: "consumables.xlsx",
@@ -154,8 +154,13 @@ sealed class BotApp
                     var userId = message.From.Id;
                     var reporter = BuildReporter(message.From);
                     _accessStore.UpdateUserProfile(userId, message.From.Username, reporter);
+                    if (_accessStore.TryPromoteUsernameAccess(userId, message.From.Username))
+                    {
+                        _allowedUserIds.Add(userId);
+                    }
+
                     var canManageAccess = _accessAdminIds.Contains(userId);
-                    var hasAccess = canManageAccess || _allowedUserIds.Contains(userId);
+                    var hasAccess = canManageAccess || _allowedUserIds.Contains(userId) || _accessStore.HasUsernameAccess(message.From.Username);
 
                     if (!hasAccess)
                     {
@@ -167,7 +172,7 @@ sealed class BotApp
                     var canComplete = _closerIds.Contains(userId);
                     var mainMenu = Keyboards.MainMenu(canComplete, canManageAccess, true);
 
-                    if (text == "Отменить заявку")
+                    if (text is "Отменить заявку" or "Назад")
                     {
                         if (_sessions.Remove(userId))
                         {
@@ -727,9 +732,17 @@ sealed class BotApp
     private static bool? ParseRecommendationAction(string text, out long? recommendationId)
     {
         recommendationId = null;
-        if (text.StartsWith("Принять #", StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrWhiteSpace(text))
         {
-            var raw = text[9..].Trim();
+            return null;
+        }
+
+        var value = text.Trim();
+        if (value.StartsWith("Принять", StringComparison.OrdinalIgnoreCase))
+        {
+            var idx = value.IndexOf('#');
+            if (idx < 0) return null;
+            var raw = value[(idx + 1)..].Trim();
             if (long.TryParse(raw, out var id))
             {
                 recommendationId = id;
@@ -739,9 +752,11 @@ sealed class BotApp
             return null;
         }
 
-        if (text.StartsWith("Отклонить #", StringComparison.OrdinalIgnoreCase))
+        if (value.StartsWith("Отклонить", StringComparison.OrdinalIgnoreCase))
         {
-            var raw = text[10..].Trim();
+            var idx = value.IndexOf('#');
+            if (idx < 0) return null;
+            var raw = value[(idx + 1)..].Trim();
             if (long.TryParse(raw, out var id))
             {
                 recommendationId = id;
@@ -792,7 +807,7 @@ sealed class BotApp
             or "Управление доступом" or "Добавить пользователя" or "Удалить пользователя" or "Список пользователей" or "Рекомендации" or "Рекомендовать пользователя"
             or "Выдать доступ" or "Забрать доступ" or "Выдать завершение" or "Забрать завершение" or "Выдать управление" or "Забрать управление"
             or "Вкл увед. заявок" or "Выкл увед. заявок" or "Вкл увед. рек." or "Выкл увед. рек."
-            or "Принять #" or "Отклонить #";
+            or "Принять #" or "Отклонить #" or "Назад";
     }
 
     private static string BuildReporter(User user)
@@ -1160,7 +1175,7 @@ static class Keyboards
     public static object NoAccess => Keyboard([["/start"]]);
     public static object CategoryMenu => Keyboard([["Заявки на дроны"], ["Заявки на ремонт"], ["Заявки на комлектующие"]]);
     public static object RequestMode => Keyboard([["Обычная заявка", "Ремонт"], ["Комплектующие и расходники"]]);
-    public static object AccessManageMenu => Keyboard([["Добавить пользователя", "Удалить пользователя"], ["Выдать доступ", "Забрать доступ"], ["Выдать завершение", "Забрать завершение"], ["Выдать управление", "Забрать управление"], ["Вкл увед. заявок", "Выкл увед. заявок"], ["Вкл увед. рек.", "Выкл увед. рек."], ["Список пользователей", "Рекомендации"], ["Отменить заявку"]]);
+    public static object AccessManageMenu => Keyboard([["Добавить пользователя", "Удалить пользователя"], ["Выдать доступ", "Забрать доступ"], ["Выдать завершение", "Забрать завершение"], ["Выдать управление", "Забрать управление"], ["Вкл увед. заявок", "Выкл увед. заявок"], ["Вкл увед. рек.", "Выкл увед. рек."], ["Список пользователей", "Рекомендации"], ["Назад"]]);
     public static object PilotType => Keyboard([["КТ", "Оптика", "СТ"]]);
     public static object CancelOnly => Keyboard([["Отменить заявку"]]);
     public static object VideoFrequency => Keyboard([["5.8", "3.4", "3.3"], ["1.5", "1.2"]]);
@@ -1220,7 +1235,7 @@ static class Keyboards
             .Select(chunk => chunk.ToArray())
             .ToList();
 
-        rows.Add(new[] { "Отменить заявку" });
+        rows.Add(new[] { "Назад" });
         return Keyboard(rows.ToArray());
     }
 
@@ -1232,7 +1247,7 @@ static class Keyboards
             .Select(chunk => chunk.ToArray())
             .ToList();
 
-        rows.Add(new[] { "Отменить заявку" });
+        rows.Add(new[] { "Назад" });
         return Keyboard(rows.ToArray());
     }
 
@@ -1924,8 +1939,10 @@ sealed class AccessStore
 
     private const string SheetName = "Users";
     private const string RecommendationSheetName = "Recommendations";
+    private const string UsernameAccessSheetName = "UsernameAccess";
     private static readonly string[] Headers = ["UserId", "DisplayName", "CanUseBot", "CanComplete", "CanManageAccess", "NotifyRequests", "NotifyRecommendations", "AddedAt", "Username"];
     private static readonly string[] RecommendationHeaders = ["ID", "Дата", "Рекомендовал", "Кандидат Username", "Кандидат ID", "Комментарий", "Статус", "Проверено", "Кем проверено"];
+    private static readonly string[] UsernameAccessHeaders = ["Username", "CanUseBot", "AddedAt"];
 
     public AccessStore(string excelPath)
     {
@@ -2058,6 +2075,88 @@ sealed class AccessStore
         return existed;
     }
 
+    private static void UpsertUsernameAccess(IXLWorkbook workbook, string username)
+    {
+        var normalized = NormalizeUsername(username);
+        if (normalized is null)
+        {
+            return;
+        }
+
+        var ws = workbook.Worksheet(UsernameAccessSheetName);
+        var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+        for (var r = 2; r <= lastRow; r++)
+        {
+            if (!string.Equals(ws.Cell(r, 1).GetString(), normalized, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            ws.Cell(r, 2).Value = "1";
+            if (string.IsNullOrWhiteSpace(ws.Cell(r, 3).GetString()))
+            {
+                ws.Cell(r, 3).Value = DateTime.Now.ToString("s");
+            }
+
+            return;
+        }
+
+        var row = lastRow + 1;
+        ws.Cell(row, 1).Value = normalized;
+        ws.Cell(row, 2).Value = "1";
+        ws.Cell(row, 3).Value = DateTime.Now.ToString("s");
+    }
+
+    public bool HasUsernameAccess(string? username)
+    {
+        var normalized = NormalizeUsername(username ?? string.Empty);
+        if (normalized is null)
+        {
+            return false;
+        }
+
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            var ws = workbook.Worksheet(UsernameAccessSheetName);
+            var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+            for (var r = 2; r <= lastRow; r++)
+            {
+                var stored = ws.Cell(r, 1).GetString();
+                if (!string.Equals(stored, normalized, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                return ws.Cell(r, 2).GetString() == "1";
+            }
+
+            return false;
+        }
+    }
+
+    public void GrantUsernameAccess(string username)
+    {
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            UpsertUsernameAccess(workbook, username);
+            workbook.SaveAs(_excelPath);
+        }
+    }
+
+    public bool TryPromoteUsernameAccess(long userId, string? username)
+    {
+        var normalized = NormalizeUsername(username ?? string.Empty);
+        if (normalized is null || !HasUsernameAccess(normalized))
+        {
+            return false;
+        }
+
+        UpdatePermissions(userId, canUseBot: true);
+        return true;
+    }
+
     public long AddRecommendation(string recommender, string recommendedUsername, string note)
     {
         lock (_sync)
@@ -2154,11 +2253,15 @@ sealed class AccessStore
                     {
                         ws.Cell(r, 5).Value = targetUserId.Value.ToString();
                     }
+                    else
+                    {
+                        UpsertUsernameAccess(workbook, uname);
+                    }
                 }
 
                 workbook.SaveAs(_excelPath);
                 var message = accept
-                    ? (targetUserId.HasValue ? "Рекомендация принята, доступ выдан." : "Рекомендация принята, но пользователь с таким username пока не найден в базе.")
+                    ? (targetUserId.HasValue ? "Рекомендация принята, доступ выдан." : "Рекомендация принята. Доступ будет выдан, когда пользователь с этим username впервые напишет боту.")
                     : "Рекомендация отклонена.";
                 return new RecommendationReviewResult(true, message, targetUserId);
             }
@@ -2269,6 +2372,15 @@ sealed class AccessStore
 
                 recommendationSheetNew.Range(1, 1, 1, RecommendationHeaders.Length).Style.Font.Bold = true;
                 recommendationSheetNew.Columns().AdjustToContents();
+
+                var usernameAccessSheetNew = wb.Worksheets.Add(UsernameAccessSheetName);
+                for (var i = 0; i < UsernameAccessHeaders.Length; i++)
+                {
+                    usernameAccessSheetNew.Cell(1, i + 1).Value = UsernameAccessHeaders[i];
+                }
+
+                usernameAccessSheetNew.Range(1, 1, 1, UsernameAccessHeaders.Length).Style.Font.Bold = true;
+                usernameAccessSheetNew.Columns().AdjustToContents();
                 wb.SaveAs(_excelPath);
                 return;
             }
@@ -2299,6 +2411,19 @@ sealed class AccessStore
 
             recommendationSheet.Range(1, 1, 1, RecommendationHeaders.Length).Style.Font.Bold = true;
             recommendationSheet.Columns().AdjustToContents();
+
+            if (!existing.TryGetWorksheet(UsernameAccessSheetName, out var usernameAccessSheet))
+            {
+                usernameAccessSheet = existing.Worksheets.Add(UsernameAccessSheetName);
+            }
+
+            for (var i = 0; i < UsernameAccessHeaders.Length; i++)
+            {
+                usernameAccessSheet.Cell(1, i + 1).Value = UsernameAccessHeaders[i];
+            }
+
+            usernameAccessSheet.Range(1, 1, 1, UsernameAccessHeaders.Length).Style.Font.Bold = true;
+            usernameAccessSheet.Columns().AdjustToContents();
             existing.SaveAs(_excelPath);
         }
     }
