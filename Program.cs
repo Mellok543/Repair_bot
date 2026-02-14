@@ -153,7 +153,7 @@ sealed class BotApp
                     var chatId = message.Chat.Id;
                     var userId = message.From.Id;
                     var reporter = BuildReporter(message.From);
-                    _accessStore.UpdateDisplayName(userId, reporter);
+                    _accessStore.UpdateUserProfile(userId, message.From.Username, reporter);
                     var canManageAccess = _accessAdminIds.Contains(userId);
                     var hasAccess = canManageAccess || _allowedUserIds.Contains(userId);
 
@@ -261,7 +261,7 @@ sealed class BotApp
                         var recommendationSession = new SessionState("recommend_user_id");
                         recommendationSession.Data["recommender"] = reporter;
                         _sessions[userId] = recommendationSession;
-                        await SendMessageAsync(chatId, "Введите Telegram ID пользователя, которого хотите рекомендовать:", Keyboards.CancelOnly);
+                        await SendMessageAsync(chatId, "Введите Username пользователя (например @ivanov):", Keyboards.CancelOnly);
                         continue;
                     }
 
@@ -484,19 +484,22 @@ sealed class BotApp
 
             if (text == "Рекомендации")
             {
-                var recommendations = _accessStore.GetRecommendations();
+                var recommendations = _accessStore.GetPendingRecommendations();
                 if (recommendations.Count == 0)
                 {
-                    await SendMessageAsync(chatId, "Рекомендаций пока нет.", Keyboards.AccessManageMenu);
+                    await SendMessageAsync(chatId, "Новых рекомендаций нет.", Keyboards.AccessManageMenu);
                     return true;
                 }
 
-                await SendMessageAsync(chatId, $"Рекомендации: {recommendations.Count}", Keyboards.AccessManageMenu);
+                await SendMessageAsync(chatId, $"Новые рекомендации: {recommendations.Count}", Keyboards.AccessManageMenu);
                 foreach (var recommendation in recommendations)
                 {
                     await SendMessageAsync(chatId, recommendation.FormatCard(), Keyboards.AccessManageMenu);
                 }
 
+                session.Data["reviewer"] = BuildReporter(new User { Id = chatId });
+                session.SetStep("access_review_recommendation");
+                await SendMessageAsync(chatId, "Выберите решение:", Keyboards.RecommendationReviewList(recommendations.Select(x => x.Id)));
                 return true;
             }
 
@@ -640,15 +643,45 @@ sealed class BotApp
             return true;
         }
 
-        if (session.Step == "recommend_user_id")
+        if (session.Step == "access_review_recommendation")
         {
-            if (!long.TryParse(text, out var recommendedUserId))
+            var accepted = ParseRecommendationAction(text, out var recommendationId);
+            if (accepted is null || recommendationId is null)
             {
-                await SendMessageAsync(chatId, "Введите корректный Telegram ID (число).", Keyboards.CancelOnly);
+                await SendMessageAsync(chatId, "Выберите кнопкой: Принять #ID или Отклонить #ID.", Keyboards.ForStep(session.Step));
                 return true;
             }
 
-            session.Data["recommended_user_id"] = recommendedUserId.ToString();
+            var reviewer = session.Data.GetValueOrDefault("reviewer", "admin");
+            var result = _accessStore.ReviewRecommendation(recommendationId.Value, accepted.Value, reviewer);
+            if (!result.Ok)
+            {
+                await SendMessageAsync(chatId, result.Message, Keyboards.AccessManageMenu);
+                session.SetStep("done");
+                return true;
+            }
+
+            if (accepted.Value && result.TargetUserId.HasValue)
+            {
+                _accessStore.UpdatePermissions(result.TargetUserId.Value, canUseBot: true);
+                _allowedUserIds.Add(result.TargetUserId.Value);
+            }
+
+            await SendMessageAsync(chatId, result.Message, Keyboards.AccessManageMenu);
+            session.SetStep("done");
+            return true;
+        }
+
+        if (session.Step == "recommend_user_id")
+        {
+            var username = NormalizeUsername(text);
+            if (username is null)
+            {
+                await SendMessageAsync(chatId, "Введите корректный Username (пример: @ivanov).", Keyboards.CancelOnly);
+                return true;
+            }
+
+            session.Data["recommended_username"] = username;
             session.SetStep("recommend_note");
             await SendMessageAsync(chatId, "Добавьте комментарий (по желанию, отправьте - если без комментария):", Keyboards.CancelOnly);
             return true;
@@ -658,16 +691,67 @@ sealed class BotApp
         {
             var note = string.IsNullOrWhiteSpace(text) || text.Trim() == "-" ? "-" : text.Trim();
             var recommender = session.Data.GetValueOrDefault("recommender", "Неизвестно");
-            var recommendedId = long.Parse(session.Data["recommended_user_id"]);
-            var recommendationId = _accessStore.AddRecommendation(recommender, recommendedId, note);
+            var recommendedUsername = session.Data.GetValueOrDefault("recommended_username", "");
+            var recommendationId = _accessStore.AddRecommendation(recommender, recommendedUsername, note);
 
             await SendMessageAsync(chatId, $"Рекомендация #{recommendationId} отправлена на рассмотрение.", mainMenu);
-            await NotifyRecommendationAsync($"Новая рекомендация #{recommendationId}\nРекомендовал: {recommender}\nКандидат ID: {recommendedId}\nКомментарий: {note}");
+            await NotifyRecommendationAsync($"Новая рекомендация #{recommendationId}\nРекомендовал: {recommender}\nКандидат Username: @{recommendedUsername}\nКомментарий: {note}");
             session.SetStep("done");
             return true;
         }
 
         return false;
+    }
+
+    private static string? NormalizeUsername(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return null;
+        }
+
+        var value = text.Trim();
+        if (value.StartsWith('@'))
+        {
+            value = value[1..];
+        }
+
+        if (value.Length < 3 || value.Length > 64)
+        {
+            return null;
+        }
+
+        return value.All(ch => char.IsLetterOrDigit(ch) || ch == '_') ? value.ToLowerInvariant() : null;
+    }
+
+    private static bool? ParseRecommendationAction(string text, out long? recommendationId)
+    {
+        recommendationId = null;
+        if (text.StartsWith("Принять #", StringComparison.OrdinalIgnoreCase))
+        {
+            var raw = text[9..].Trim();
+            if (long.TryParse(raw, out var id))
+            {
+                recommendationId = id;
+                return true;
+            }
+
+            return null;
+        }
+
+        if (text.StartsWith("Отклонить #", StringComparison.OrdinalIgnoreCase))
+        {
+            var raw = text[10..].Trim();
+            if (long.TryParse(raw, out var id))
+            {
+                recommendationId = id;
+                return false;
+            }
+
+            return null;
+        }
+
+        return null;
     }
 
     private static string? NormalizeCategory(string text) => text switch
@@ -707,7 +791,8 @@ sealed class BotApp
             or "Завершить заявку" or "Заявки на дроны" or "Заявки на ремонт" or "Заявки на комлектующие" or "Заявки на комплектующие"
             or "Управление доступом" or "Добавить пользователя" or "Удалить пользователя" or "Список пользователей" or "Рекомендации" or "Рекомендовать пользователя"
             or "Выдать доступ" or "Забрать доступ" or "Выдать завершение" or "Забрать завершение" or "Выдать управление" or "Забрать управление"
-            or "Вкл увед. заявок" or "Выкл увед. заявок" or "Вкл увед. рек." or "Выкл увед. рек.";
+            or "Вкл увед. заявок" or "Выкл увед. заявок" or "Вкл увед. рек." or "Выкл увед. рек."
+            or "Принять #" or "Отклонить #";
     }
 
     private static string BuildReporter(User user)
@@ -1102,6 +1187,7 @@ static class Keyboards
             or "access_enable_rec_notify" or "access_disable_rec_notify"
             or "recommend_user_id" or "recommend_note" => CancelOnly,
         "access_manage_menu" => AccessManageMenu,
+        "access_review_recommendation" => RecommendationReviewList([]),
         _ => MainMenu(false, false, false)
     };
 
@@ -1130,6 +1216,18 @@ static class Keyboards
     {
         var rows = ids
             .Select(id => $"Завершить #{id}")
+            .Chunk(2)
+            .Select(chunk => chunk.ToArray())
+            .ToList();
+
+        rows.Add(new[] { "Отменить заявку" });
+        return Keyboard(rows.ToArray());
+    }
+
+    public static object RecommendationReviewList(IEnumerable<long> ids)
+    {
+        var rows = ids
+            .SelectMany(id => new[] { $"Принять #{id}", $"Отклонить #{id}" })
             .Chunk(2)
             .Select(chunk => chunk.ToArray())
             .ToList();
@@ -1826,8 +1924,8 @@ sealed class AccessStore
 
     private const string SheetName = "Users";
     private const string RecommendationSheetName = "Recommendations";
-    private static readonly string[] Headers = ["UserId", "DisplayName", "CanUseBot", "CanComplete", "CanManageAccess", "NotifyRequests", "NotifyRecommendations", "AddedAt"];
-    private static readonly string[] RecommendationHeaders = ["ID", "Дата", "Рекомендовал", "Кандидат ID", "Комментарий"];
+    private static readonly string[] Headers = ["UserId", "DisplayName", "CanUseBot", "CanComplete", "CanManageAccess", "NotifyRequests", "NotifyRecommendations", "AddedAt", "Username"];
+    private static readonly string[] RecommendationHeaders = ["ID", "Дата", "Рекомендовал", "Кандидат Username", "Кандидат ID", "Комментарий", "Статус", "Проверено", "Кем проверено"];
 
     public AccessStore(string excelPath)
     {
@@ -1857,7 +1955,8 @@ sealed class AccessStore
                     CanComplete: ws.Cell(r, 4).GetString() == "1",
                     CanManageAccess: ws.Cell(r, 5).GetString() == "1",
                     NotifyRequests: ws.Cell(r, 6).GetString() == "1",
-                    NotifyRecommendations: ws.Cell(r, 7).GetString() == "1"));
+                    NotifyRecommendations: ws.Cell(r, 7).GetString() == "1",
+                    Username: ws.Cell(r, 9).GetString()));
             }
 
             return result.OrderBy(x => x.UserId).ToList();
@@ -1894,19 +1993,28 @@ sealed class AccessStore
         }
     }
 
-    public void UpdateDisplayName(long userId, string displayName)
+    public void UpdateUserProfile(long userId, string? username, string displayName)
     {
-        if (string.IsNullOrWhiteSpace(displayName))
-        {
-            return;
-        }
-
         lock (_sync)
         {
             using var workbook = OpenWorkbook();
             var ws = workbook.Worksheet(SheetName);
             var row = FindOrCreateRow(ws, userId);
-            ws.Cell(row, 2).Value = displayName.Trim();
+
+            if (!string.IsNullOrWhiteSpace(displayName))
+            {
+                ws.Cell(row, 2).Value = displayName.Trim();
+            }
+
+            if (!string.IsNullOrWhiteSpace(username))
+            {
+                var normalized = NormalizeUsername(username);
+                if (normalized is not null)
+                {
+                    ws.Cell(row, 9).Value = normalized;
+                }
+            }
+
             workbook.SaveAs(_excelPath);
         }
     }
@@ -1930,6 +2038,7 @@ sealed class AccessStore
             if (notifyRequests.HasValue) ws.Cell(row, 6).Value = notifyRequests.Value ? "1" : "0";
             if (notifyRecommendations.HasValue) ws.Cell(row, 7).Value = notifyRecommendations.Value ? "1" : "0";
             if (string.IsNullOrWhiteSpace(ws.Cell(row, 8).GetString())) ws.Cell(row, 8).Value = DateTime.Now.ToString("s");
+            if (string.IsNullOrWhiteSpace(ws.Cell(row, 2).GetString())) ws.Cell(row, 2).Value = "-";
 
             workbook.SaveAs(_excelPath);
         }
@@ -1949,7 +2058,7 @@ sealed class AccessStore
         return existed;
     }
 
-    public long AddRecommendation(string recommender, long recommendedUserId, string note)
+    public long AddRecommendation(string recommender, string recommendedUsername, string note)
     {
         lock (_sync)
         {
@@ -1960,8 +2069,13 @@ sealed class AccessStore
             ws.Cell(row, 1).Value = nextId;
             ws.Cell(row, 2).Value = DateTime.Now.ToString("s");
             ws.Cell(row, 3).Value = recommender;
-            ws.Cell(row, 4).Value = recommendedUserId;
-            ws.Cell(row, 5).Value = note;
+            ws.Cell(row, 4).Value = recommendedUsername;
+            var resolvedId = TryResolveUserIdByUsername(ws.Workbook.Worksheet(SheetName), recommendedUsername);
+            ws.Cell(row, 5).Value = resolvedId?.ToString() ?? "";
+            ws.Cell(row, 6).Value = note;
+            ws.Cell(row, 7).Value = "pending";
+            ws.Cell(row, 8).Value = "";
+            ws.Cell(row, 9).Value = "";
             workbook.SaveAs(_excelPath);
             return nextId;
         }
@@ -1987,12 +2101,117 @@ sealed class AccessStore
                     Id: long.Parse(ws.Cell(r, 1).GetString()),
                     CreatedAt: DateTime.Parse(ws.Cell(r, 2).GetString()),
                     Recommender: ws.Cell(r, 3).GetString(),
-                    RecommendedUserId: long.Parse(ws.Cell(r, 4).GetString()),
-                    Note: ws.Cell(r, 5).GetString()));
+                    RecommendedUsername: ws.Cell(r, 4).GetString(),
+                    RecommendedUserId: long.TryParse(ws.Cell(r, 5).GetString(), out var rid) ? rid : null,
+                    Note: ws.Cell(r, 6).GetString(),
+                    Status: string.IsNullOrWhiteSpace(ws.Cell(r, 7).GetString()) ? "pending" : ws.Cell(r, 7).GetString(),
+                    ReviewedAt: string.IsNullOrWhiteSpace(ws.Cell(r, 8).GetString()) ? null : DateTime.Parse(ws.Cell(r, 8).GetString()),
+                    ReviewedBy: ws.Cell(r, 9).GetString()));
             }
 
             return result.OrderByDescending(x => x.Id).ToList();
         }
+    }
+
+    public List<UserRecommendation> GetPendingRecommendations() => GetRecommendations()
+        .Where(x => x.Status == "pending")
+        .OrderByDescending(x => x.Id)
+        .ToList();
+
+    public RecommendationReviewResult ReviewRecommendation(long id, bool accept, string reviewer)
+    {
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            var ws = workbook.Worksheet(RecommendationSheetName);
+            var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+            for (var r = 2; r <= lastRow; r++)
+            {
+                if (!long.TryParse(ws.Cell(r, 1).GetString(), out var recId) || recId != id)
+                {
+                    continue;
+                }
+
+                var status = string.IsNullOrWhiteSpace(ws.Cell(r, 7).GetString()) ? "pending" : ws.Cell(r, 7).GetString();
+                if (status != "pending")
+                {
+                    return new RecommendationReviewResult(false, "Рекомендация уже обработана.", null);
+                }
+
+                ws.Cell(r, 7).Value = accept ? "accepted" : "rejected";
+                ws.Cell(r, 8).Value = DateTime.Now.ToString("s");
+                ws.Cell(r, 9).Value = reviewer;
+
+                long? targetUserId = long.TryParse(ws.Cell(r, 5).GetString(), out var uid) ? uid : null;
+
+                if (accept && targetUserId is null)
+                {
+                    var uname = ws.Cell(r, 4).GetString();
+                    using var usersWb = OpenWorkbook();
+                    var usersWs = usersWb.Worksheet(SheetName);
+                    targetUserId = TryResolveUserIdByUsername(usersWs, uname);
+                    if (targetUserId.HasValue)
+                    {
+                        ws.Cell(r, 5).Value = targetUserId.Value.ToString();
+                    }
+                }
+
+                workbook.SaveAs(_excelPath);
+                var message = accept
+                    ? (targetUserId.HasValue ? "Рекомендация принята, доступ выдан." : "Рекомендация принята, но пользователь с таким username пока не найден в базе.")
+                    : "Рекомендация отклонена.";
+                return new RecommendationReviewResult(true, message, targetUserId);
+            }
+
+            return new RecommendationReviewResult(false, "Рекомендация не найдена.", null);
+        }
+    }
+
+    private static long? TryResolveUserIdByUsername(IXLWorksheet usersWs, string username)
+    {
+        var normalized = NormalizeUsername(username);
+        if (normalized is null)
+        {
+            return null;
+        }
+
+        var lastRow = usersWs.LastRowUsed()?.RowNumber() ?? 1;
+        for (var r = 2; r <= lastRow; r++)
+        {
+            if (!long.TryParse(usersWs.Cell(r, 1).GetString(), out var userId))
+            {
+                continue;
+            }
+
+            var storedUsername = usersWs.Cell(r, 9).GetString();
+            if (string.Equals(storedUsername, normalized, StringComparison.OrdinalIgnoreCase))
+            {
+                return userId;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? NormalizeUsername(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return null;
+        }
+
+        var value = text.Trim();
+        if (value.StartsWith('@'))
+        {
+            value = value[1..];
+        }
+
+        if (value.Length < 3 || value.Length > 64)
+        {
+            return null;
+        }
+
+        return value.All(ch => char.IsLetterOrDigit(ch) || ch == '_') ? value.ToLowerInvariant() : null;
     }
 
     private static long NextRecommendationId(IXLWorksheet ws)
@@ -2087,6 +2306,8 @@ sealed class AccessStore
     private XLWorkbook OpenWorkbook() => new(_excelPath);
 }
 
+record RecommendationReviewResult(bool Ok, string Message, long? TargetUserId);
+
 record UserAccessEntry(
     long UserId,
     string DisplayName,
@@ -2094,13 +2315,14 @@ record UserAccessEntry(
     bool CanComplete,
     bool CanManageAccess,
     bool NotifyRequests,
-    bool NotifyRecommendations)
+    bool NotifyRecommendations,
+    string Username)
 {
     public string FormatCard()
     {
         var sb = new StringBuilder();
         sb.AppendLine($"ID: {UserId}");
-        sb.AppendLine($"Юзернейм: {DisplayName}");
+        sb.AppendLine($"Юзернейм: {(string.IsNullOrWhiteSpace(Username) ? DisplayName : "@" + Username)}");
         sb.AppendLine($"Доступ к боту: {(CanUseBot ? "Да" : "Нет")}");
         sb.AppendLine($"Завершение заявок: {(CanComplete ? "Да" : "Нет")}");
         sb.AppendLine($"Управление доступом: {(CanManageAccess ? "Да" : "Нет")}");
@@ -2114,8 +2336,12 @@ record UserRecommendation(
     long Id,
     DateTime CreatedAt,
     string Recommender,
-    long RecommendedUserId,
-    string Note)
+    string RecommendedUsername,
+    long? RecommendedUserId,
+    string Note,
+    string Status,
+    DateTime? ReviewedAt,
+    string ReviewedBy)
 {
     public string FormatCard()
     {
@@ -2123,8 +2349,15 @@ record UserRecommendation(
         sb.AppendLine($"ID: {Id}");
         sb.AppendLine($"Дата: {CreatedAt:dd.MM HH:mm}");
         sb.AppendLine($"Рекомендовал: {Recommender}");
-        sb.AppendLine($"Кандидат ID: {RecommendedUserId}");
+        sb.AppendLine($"Кандидат Username: @{RecommendedUsername}");
+        sb.AppendLine($"Кандидат ID: {(RecommendedUserId.HasValue ? RecommendedUserId.Value.ToString() : "не найден")}");
         sb.AppendLine($"Комментарий: {Note}");
+        sb.AppendLine($"Статус: {Status}");
+        if (Status != "pending")
+        {
+            sb.AppendLine($"Проверено: {(ReviewedAt.HasValue ? ReviewedAt.Value.ToString("dd.MM HH:mm") : "-")}");
+            sb.AppendLine($"Кем: {ReviewedBy}");
+        }
         return sb.ToString().TrimEnd();
     }
 }
