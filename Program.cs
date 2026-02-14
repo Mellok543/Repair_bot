@@ -4,37 +4,45 @@ using System.Text.Json.Serialization;
 using ClosedXML.Excel;
 
 var settings = AppSettings.Default;
-if (string.IsNullOrWhiteSpace(settings.BotToken) || settings.BotToken.Contains("PASTE_YOUR", StringComparison.OrdinalIgnoreCase))
+var botToken = Environment.GetEnvironmentVariable("BOT_TOKEN");
+if (string.IsNullOrWhiteSpace(botToken))
 {
-    throw new InvalidOperationException("Откройте AppSettings в Program.cs и укажите реальный BotToken.");
+    throw new InvalidOperationException("Укажите BOT_TOKEN в переменных окружения.");
 }
 
 var tablesDir = Path.GetFullPath(settings.TablesDirectory);
 Directory.CreateDirectory(tablesDir);
 
 var app = new BotApp(
-    settings.BotToken,
+    botToken,
     Path.Combine(tablesDir, settings.ExcelPath),
     Path.Combine(tablesDir, settings.RepairExcelPath),
     Path.Combine(tablesDir, settings.ConsumablesExcelPath),
-    settings.CloserIds);
+    Path.Combine(tablesDir, settings.AccessExcelPath),
+    settings.CloserIds,
+    settings.AccessAdminIds,
+    settings.AllowedUserIds);
 await app.RunAsync();
 
 sealed record AppSettings(
-    string BotToken,
     string TablesDirectory,
     string ExcelPath,
     string RepairExcelPath,
     string ConsumablesExcelPath,
-    HashSet<long> CloserIds)
+    string AccessExcelPath,
+    HashSet<long> CloserIds,
+    HashSet<long> AccessAdminIds,
+    HashSet<long> AllowedUserIds)
 {
     public static AppSettings Default => new(
-        BotToken: "7796200129:AAFEfT-KBeqsGzfXBBqvbrH_XuP_XrK3gpU",
         TablesDirectory: "/var/lib/repair_bot/excel",
         ExcelPath: "applications.xlsx",
         RepairExcelPath: "repairs.xlsx",
         ConsumablesExcelPath: "consumables.xlsx",
-        CloserIds: [992964625, 222222222]
+        AccessExcelPath: "access_users.xlsx",
+        CloserIds: [992964625, 222222222],
+        AccessAdminIds: [992964625],
+        AllowedUserIds: [992964625, 222222222]
     );
 }
 
@@ -52,17 +60,35 @@ sealed class BotApp
     private readonly ApplicationStore _store;
     private readonly RepairStore _repairStore;
     private readonly ConsumablesStore _consumablesStore;
+    private readonly AccessStore _accessStore;
     private readonly HashSet<long> _closerIds;
+    private readonly HashSet<long> _accessAdminIds;
+    private readonly HashSet<long> _allowedUserIds;
     private readonly Dictionary<long, SessionState> _sessions = new();
     private int _offset;
 
-    public BotApp(string token, string excelPath, string repairExcelPath, string consumablesExcelPath, HashSet<long> closerIds)
+    public BotApp(
+        string token,
+        string excelPath,
+        string repairExcelPath,
+        string consumablesExcelPath,
+        string accessExcelPath,
+        HashSet<long> closerIds,
+        HashSet<long> accessAdminIds,
+        HashSet<long> initialAllowedUserIds)
     {
         _token = token;
         _closerIds = closerIds;
+        _accessAdminIds = accessAdminIds;
         _store = new ApplicationStore(excelPath);
         _repairStore = new RepairStore(repairExcelPath);
         _consumablesStore = new ConsumablesStore(consumablesExcelPath);
+        _accessStore = new AccessStore(accessExcelPath, initialAllowedUserIds.Concat(accessAdminIds));
+        _allowedUserIds = _accessStore.GetAllUserIds();
+        foreach (var adminId in _accessAdminIds)
+        {
+            _allowedUserIds.Add(adminId);
+        }
     }
 
     public async Task RunAsync()
@@ -88,8 +114,18 @@ sealed class BotApp
                     var chatId = message.Chat.Id;
                     var userId = message.From.Id;
                     var reporter = BuildReporter(message.From);
+                    var canManageAccess = _accessAdminIds.Contains(userId);
+                    var hasAccess = canManageAccess || _allowedUserIds.Contains(userId);
 
-                    var mainMenu = Keyboards.MainMenu(_closerIds.Contains(userId));
+                    if (!hasAccess)
+                    {
+                        _sessions.Remove(userId);
+                        await SendMessageAsync(chatId, "У вас нет доступа к боту.", Keyboards.NoAccess);
+                        continue;
+                    }
+
+                    var canComplete = _closerIds.Contains(userId);
+                    var mainMenu = Keyboards.MainMenu(canComplete, canManageAccess);
 
                     if (text == "Отменить заявку")
                     {
@@ -116,7 +152,7 @@ sealed class BotApp
                     }
 
                     if (_sessions.TryGetValue(userId, out var menuSession) &&
-                        await TryHandleMenuSessionAsync(menuSession, text, chatId, mainMenu))
+                        await TryHandleMenuSessionAsync(menuSession, text, chatId, mainMenu, canManageAccess))
                     {
                         if (menuSession.Step == "done")
                         {
@@ -156,7 +192,7 @@ sealed class BotApp
 
                     if (text == "Завершить заявку")
                     {
-                        if (!_closerIds.Contains(userId))
+                        if (!canComplete)
                         {
                             await SendMessageAsync(chatId, "У вас нет прав завершать заявки.", mainMenu);
                             continue;
@@ -164,6 +200,19 @@ sealed class BotApp
 
                         _sessions[userId] = new SessionState("complete_category");
                         await SendMessageAsync(chatId, "Выберите категорию для завершения:", Keyboards.CategoryMenu);
+                        continue;
+                    }
+
+                    if (text == "Управление доступом")
+                    {
+                        if (!canManageAccess)
+                        {
+                            await SendMessageAsync(chatId, "У вас нет прав управлять доступом.", mainMenu);
+                            continue;
+                        }
+
+                        _sessions[userId] = new SessionState("access_manage_menu");
+                        await SendMessageAsync(chatId, "Управление доступом:", Keyboards.AccessManageMenu);
                         continue;
                     }
 
@@ -210,7 +259,7 @@ sealed class BotApp
         }
     }
 
-    private async Task<bool> TryHandleMenuSessionAsync(SessionState session, string text, long chatId, object mainMenu)
+    private async Task<bool> TryHandleMenuSessionAsync(SessionState session, string text, long chatId, object mainMenu, bool canManageAccess)
     {
         if (session.Step is "view_active_category" or "view_completed_category")
         {
@@ -339,6 +388,93 @@ sealed class BotApp
             return true;
         }
 
+
+        if (session.Step == "access_manage_menu")
+        {
+            if (!canManageAccess)
+            {
+                await SendMessageAsync(chatId, "У вас нет прав управлять доступом.", mainMenu);
+                session.SetStep("done");
+                return true;
+            }
+
+            if (text == "Добавить пользователя")
+            {
+                session.SetStep("access_add_user");
+                await SendMessageAsync(chatId, "Введите Telegram ID пользователя для выдачи доступа:", Keyboards.CancelOnly);
+                return true;
+            }
+
+            if (text == "Удалить пользователя")
+            {
+                session.SetStep("access_remove_user");
+                await SendMessageAsync(chatId, "Введите Telegram ID пользователя для удаления доступа:", Keyboards.CancelOnly);
+                return true;
+            }
+
+            if (text == "Список пользователей")
+            {
+                var ids = _accessStore.GetAllUserIds().OrderBy(x => x).ToArray();
+                var list = ids.Length == 0 ? "Список доступа пуст." : "Пользователи с доступом:\n" + string.Join("\n", ids.Select(x => x.ToString()));
+                await SendMessageAsync(chatId, list, Keyboards.AccessManageMenu);
+                return true;
+            }
+
+            await SendMessageAsync(chatId, "Выберите действие кнопкой.", Keyboards.AccessManageMenu);
+            return true;
+        }
+
+        if (session.Step == "access_add_user")
+        {
+            if (!canManageAccess)
+            {
+                await SendMessageAsync(chatId, "У вас нет прав управлять доступом.", mainMenu);
+                session.SetStep("done");
+                return true;
+            }
+
+            if (!long.TryParse(text, out var addUserId))
+            {
+                await SendMessageAsync(chatId, "Введите корректный Telegram ID (число).", Keyboards.CancelOnly);
+                return true;
+            }
+
+            var added = _accessStore.AddUser(addUserId);
+            _allowedUserIds.Add(addUserId);
+            await SendMessageAsync(chatId, added ? $"Доступ выдан пользователю {addUserId}." : $"Пользователь {addUserId} уже есть в списке доступа.", mainMenu);
+            session.SetStep("done");
+            return true;
+        }
+
+        if (session.Step == "access_remove_user")
+        {
+            if (!canManageAccess)
+            {
+                await SendMessageAsync(chatId, "У вас нет прав управлять доступом.", mainMenu);
+                session.SetStep("done");
+                return true;
+            }
+
+            if (!long.TryParse(text, out var removeUserId))
+            {
+                await SendMessageAsync(chatId, "Введите корректный Telegram ID (число).", Keyboards.CancelOnly);
+                return true;
+            }
+
+            if (_accessAdminIds.Contains(removeUserId))
+            {
+                await SendMessageAsync(chatId, "Нельзя удалить доступ у администратора доступа.", mainMenu);
+                session.SetStep("done");
+                return true;
+            }
+
+            var removed = _accessStore.RemoveUser(removeUserId);
+            _allowedUserIds.Remove(removeUserId);
+            await SendMessageAsync(chatId, removed ? $"Доступ пользователя {removeUserId} удалён." : $"Пользователь {removeUserId} не найден в списке доступа.", mainMenu);
+            session.SetStep("done");
+            return true;
+        }
+
         return false;
     }
 
@@ -376,7 +512,8 @@ sealed class BotApp
     private static bool IsMenuCommand(string text)
     {
         return text is "/start" or "Меню" or "Оставить заявку" or "Активные заявки" or "Завершенные заявки"
-            or "Завершить заявку" or "Заявки на дроны" or "Заявки на ремонт" or "Заявки на комлектующие" or "Заявки на комплектующие";
+            or "Завершить заявку" or "Заявки на дроны" or "Заявки на ремонт" or "Заявки на комлектующие" or "Заявки на комплектующие"
+            or "Управление доступом" or "Добавить пользователя" or "Удалить пользователя" or "Список пользователей";
     }
 
     private static string BuildReporter(User user)
@@ -664,7 +801,8 @@ sealed class SessionState(string step)
     {
         return Step is "callsign" or "pilot_number" or "rx_firmware" or "regularity_domain" or "bind_phrase" or "quantity" or "note"
             or "repair_equipment" or "repair_fault" or "repair_quantity" or "repair_note"
-            or "consumables_needed" or "consumables_quantity" or "consumables_note";
+            or "consumables_needed" or "consumables_quantity" or "consumables_note"
+            or "access_add_user" or "access_remove_user";
     }
 
     public string[] DroneOptions()
@@ -680,11 +818,31 @@ sealed class SessionState(string step)
 
 static class Keyboards
 {
-    public static object MainMenu(bool canComplete) => canComplete
-        ? Keyboard([["Активные заявки", "Завершенные заявки"], ["Оставить заявку"], ["Завершить заявку"]])
-        : Keyboard([["Активные заявки", "Завершенные заявки"], ["Оставить заявку"]]);
+    public static object MainMenu(bool canComplete, bool canManageAccess)
+    {
+        var rows = new List<string[]>
+        {
+            new[] { "Активные заявки", "Завершенные заявки" },
+            new[] { "Оставить заявку" }
+        };
+
+        if (canComplete)
+        {
+            rows.Add(new[] { "Завершить заявку" });
+        }
+
+        if (canManageAccess)
+        {
+            rows.Add(new[] { "Управление доступом" });
+        }
+
+        return Keyboard(rows.ToArray());
+    }
+
+    public static object NoAccess => Keyboard([["/start"]]);
     public static object CategoryMenu => Keyboard([["Заявки на дроны"], ["Заявки на ремонт"], ["Заявки на комлектующие"]]);
     public static object RequestMode => Keyboard([["Обычная заявка", "Ремонт"], ["Комплектующие и расходники"]]);
+    public static object AccessManageMenu => Keyboard([["Добавить пользователя", "Удалить пользователя"], ["Список пользователей"], ["Отменить заявку"]]);
     public static object PilotType => Keyboard([["КТ", "Оптика", "СТ"]]);
     public static object CancelOnly => Keyboard([["Отменить заявку"]]);
     public static object VideoFrequency => Keyboard([["5.8", "3.4", "3.3"], ["1.5", "1.2"]]);
@@ -704,14 +862,16 @@ static class Keyboards
         "consumables_unit" => ConsumablesUnit,
         "callsign" or "pilot_number" or "rx_firmware" or "regularity_domain" or "bind_phrase" or "quantity"
             or "repair_equipment" or "repair_fault" or "repair_quantity" or "repair_note"
-            or "consumables_needed" or "consumables_quantity" or "consumables_note" => CancelOnly,
-        _ => MainMenu(false)
+            or "consumables_needed" or "consumables_quantity" or "consumables_note"
+            or "access_add_user" or "access_remove_user" => CancelOnly,
+        "access_manage_menu" => AccessManageMenu,
+        _ => MainMenu(false, false)
     };
 
     private static object DroneType(SessionState? session)
     {
         var options = session?.DroneOptions() ?? [];
-        if (options.Length == 0) return MainMenu(false);
+        if (options.Length == 0) return MainMenu(false, false);
 
         var rows = options
             .Chunk(2)
@@ -724,7 +884,7 @@ static class Keyboards
     private static object CoilKmByDrone(SessionState? session)
     {
         var options = session?.CoilOptions() ?? [];
-        if (options.Length == 0) return MainMenu(false);
+        if (options.Length == 0) return MainMenu(false, false);
 
         return Keyboard([options]);
     }
@@ -737,7 +897,7 @@ static class Keyboards
             .Select(chunk => chunk.ToArray())
             .ToList();
 
-        rows.Add(["Отменить заявку"]);
+        rows.Add(new[] { "Отменить заявку" });
         return Keyboard(rows.ToArray());
     }
 
@@ -1371,6 +1531,131 @@ sealed class ConsumablesStore
             Note: ws.Cell(row, 7).GetString(),
             Status: ws.Cell(row, 8).GetString());
     }
+}
+
+
+sealed class AccessStore
+{
+    private readonly string _excelPath;
+    private readonly object _sync = new();
+
+    private const string SheetName = "Users";
+    private static readonly string[] Headers = ["UserId", "AddedAt"];
+
+    public AccessStore(string excelPath, IEnumerable<long> seedUserIds)
+    {
+        _excelPath = excelPath;
+        Init();
+
+        foreach (var userId in seedUserIds.Distinct())
+        {
+            AddUser(userId);
+        }
+    }
+
+    public HashSet<long> GetAllUserIds()
+    {
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            var ws = workbook.Worksheet(SheetName);
+            var result = new HashSet<long>();
+            var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+            for (var r = 2; r <= lastRow; r++)
+            {
+                if (long.TryParse(ws.Cell(r, 1).GetString(), out var userId))
+                {
+                    result.Add(userId);
+                }
+            }
+
+            return result;
+        }
+    }
+
+    public bool AddUser(long userId)
+    {
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            var ws = workbook.Worksheet(SheetName);
+            var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+
+            for (var r = 2; r <= lastRow; r++)
+            {
+                if (long.TryParse(ws.Cell(r, 1).GetString(), out var existingUserId) && existingUserId == userId)
+                {
+                    return false;
+                }
+            }
+
+            var row = lastRow + 1;
+            ws.Cell(row, 1).Value = userId;
+            ws.Cell(row, 2).Value = DateTime.Now.ToString("s");
+            workbook.SaveAs(_excelPath);
+            return true;
+        }
+    }
+
+    public bool RemoveUser(long userId)
+    {
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            var ws = workbook.Worksheet(SheetName);
+            var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+
+            for (var r = 2; r <= lastRow; r++)
+            {
+                if (long.TryParse(ws.Cell(r, 1).GetString(), out var existingUserId) && existingUserId == userId)
+                {
+                    ws.Row(r).Delete();
+                    workbook.SaveAs(_excelPath);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    private void Init()
+    {
+        lock (_sync)
+        {
+            if (!File.Exists(_excelPath))
+            {
+                using var wb = new XLWorkbook();
+                var ws = wb.Worksheets.Add(SheetName);
+                for (var i = 0; i < Headers.Length; i++)
+                {
+                    ws.Cell(1, i + 1).Value = Headers[i];
+                }
+
+                ws.Range(1, 1, 1, Headers.Length).Style.Font.Bold = true;
+                ws.Columns().AdjustToContents();
+                wb.SaveAs(_excelPath);
+                return;
+            }
+
+            using var existing = new XLWorkbook(_excelPath);
+            if (!existing.TryGetWorksheet(SheetName, out var sheet))
+            {
+                sheet = existing.Worksheets.Add(SheetName);
+            }
+
+            for (var i = 0; i < Headers.Length; i++)
+            {
+                sheet.Cell(1, i + 1).Value = Headers[i];
+            }
+
+            sheet.Range(1, 1, 1, Headers.Length).Style.Font.Bold = true;
+            sheet.Columns().AdjustToContents();
+            existing.SaveAs(_excelPath);
+        }
+    }
+
+    private XLWorkbook OpenWorkbook() => new(_excelPath);
 }
 
 record Application(
