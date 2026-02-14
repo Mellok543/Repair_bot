@@ -9,15 +9,31 @@ if (string.IsNullOrWhiteSpace(settings.BotToken) || settings.BotToken.Contains("
     throw new InvalidOperationException("Откройте AppSettings в Program.cs и укажите реальный BotToken.");
 }
 
-var app = new BotApp(settings.BotToken, settings.ExcelPath, settings.RepairExcelPath, settings.CloserIds);
+var tablesDir = Path.GetFullPath(settings.TablesDirectory);
+Directory.CreateDirectory(tablesDir);
+
+var app = new BotApp(
+    settings.BotToken,
+    Path.Combine(tablesDir, settings.ExcelPath),
+    Path.Combine(tablesDir, settings.RepairExcelPath),
+    Path.Combine(tablesDir, settings.ConsumablesExcelPath),
+    settings.CloserIds);
 await app.RunAsync();
 
-sealed record AppSettings(string BotToken, string ExcelPath, string RepairExcelPath, HashSet<long> CloserIds)
+sealed record AppSettings(
+    string BotToken,
+    string TablesDirectory,
+    string ExcelPath,
+    string RepairExcelPath,
+    string ConsumablesExcelPath,
+    HashSet<long> CloserIds)
 {
     public static AppSettings Default => new(
         BotToken: "7796200129:AAFEfT-KBeqsGzfXBBqvbrH_XuP_XrK3gpU",
+        TablesDirectory: "/var/lib/repair_bot/excel",
         ExcelPath: "applications.xlsx",
         RepairExcelPath: "repairs.xlsx",
+        ConsumablesExcelPath: "consumables.xlsx",
         CloserIds: [992964625, 222222222]
     );
 }
@@ -35,16 +51,18 @@ sealed class BotApp
     private readonly HttpClient _httpClient = new();
     private readonly ApplicationStore _store;
     private readonly RepairStore _repairStore;
+    private readonly ConsumablesStore _consumablesStore;
     private readonly HashSet<long> _closerIds;
     private readonly Dictionary<long, SessionState> _sessions = new();
     private int _offset;
 
-    public BotApp(string token, string excelPath, string repairExcelPath, HashSet<long> closerIds)
+    public BotApp(string token, string excelPath, string repairExcelPath, string consumablesExcelPath, HashSet<long> closerIds)
     {
         _token = token;
         _closerIds = closerIds;
         _store = new ApplicationStore(excelPath);
         _repairStore = new RepairStore(repairExcelPath);
+        _consumablesStore = new ConsumablesStore(consumablesExcelPath);
     }
 
     public async Task RunAsync()
@@ -70,6 +88,20 @@ sealed class BotApp
                     var chatId = message.Chat.Id;
                     var userId = message.From.Id;
                     var reporter = BuildReporter(message.From);
+
+                    if (text == "Отменить заявку")
+                    {
+                        if (_sessions.Remove(userId))
+                        {
+                            await SendMessageAsync(chatId, "Заявка отменена.", Keyboards.MainMenu);
+                        }
+                        else
+                        {
+                            await SendMessageAsync(chatId, "Нет активной заявки для отмены.", Keyboards.MainMenu);
+                        }
+
+                        continue;
+                    }
 
                     if (_sessions.TryGetValue(userId, out var activeSession) &&
                         activeSession.IsManualInputStep() &&
@@ -107,13 +139,15 @@ sealed class BotApp
                         }
                         else
                         {
-                            await SendMessageAsync(chatId, $"Активные заявки: {total}", Keyboards.MainMenu);
+                            await SendMessageAsync(chatId, $"Активные заявки (всего): {total}", Keyboards.MainMenu);
 
+                            await SendMessageAsync(chatId, $"🛩 Заявки на дроны: {activeApplications.Count}", Keyboards.MainMenu);
                             foreach (var item in activeApplications)
                             {
                                 await SendMessageAsync(chatId, item.FormatCard(), Keyboards.MainMenu);
                             }
 
+                            await SendMessageAsync(chatId, $"🛠 Ремонт: {activeRepairs.Count}", Keyboards.MainMenu);
                             foreach (var item in activeRepairs)
                             {
                                 await SendMessageAsync(chatId, item.FormatCard(), Keyboards.MainMenu);
@@ -135,13 +169,15 @@ sealed class BotApp
                         }
                         else
                         {
-                            await SendMessageAsync(chatId, $"Завершённые заявки: {total}", Keyboards.MainMenu);
+                            await SendMessageAsync(chatId, $"Завершённые заявки (всего): {total}", Keyboards.MainMenu);
 
+                            await SendMessageAsync(chatId, $"🛩 Заявки на дроны: {completedApplications.Count}", Keyboards.MainMenu);
                             foreach (var item in completedApplications)
                             {
                                 await SendMessageAsync(chatId, item.FormatCard(), Keyboards.MainMenu);
                             }
 
+                            await SendMessageAsync(chatId, $"🛠 Ремонт: {completedRepairs.Count}", Keyboards.MainMenu);
                             foreach (var item in completedRepairs)
                             {
                                 await SendMessageAsync(chatId, item.FormatCard(), Keyboards.MainMenu);
@@ -210,6 +246,12 @@ sealed class BotApp
                             var repairId = _repairStore.AddRepair(reporter, session.Data);
                             var repair = _repairStore.GetById(repairId);
                             await SendMessageAsync(chatId, $"Заявка на ремонт создана!\n\n{repair.FormatCard()}", Keyboards.MainMenu);
+                        }
+                        else if (session.IsConsumablesRequest)
+                        {
+                            var consumablesId = _consumablesStore.AddRequest(reporter, session.Data);
+                            var consumables = _consumablesStore.GetById(consumablesId);
+                            await SendMessageAsync(chatId, $"Заявка на комплектующие создана!\n\n{consumables.FormatCard()}", Keyboards.MainMenu);
                         }
                         else
                         {
@@ -301,6 +343,7 @@ sealed class SessionState(string step)
     public string Step { get; private set; } = step;
     public Dictionary<string, string> Data { get; } = new();
     public bool IsRepairRequest => Data.GetValueOrDefault("request_type") == "repair" || Step.StartsWith("repair_", StringComparison.Ordinal);
+    public bool IsConsumablesRequest => Data.GetValueOrDefault("request_type") == "consumables" || Step.StartsWith("consumables_", StringComparison.Ordinal);
 
     public string? Handle(string text)
     {
@@ -321,7 +364,14 @@ sealed class SessionState(string step)
                     return "Подразделение:";
                 }
 
-                return "Выберите тип заявки кнопкой: Обычная заявка или Ремонт";
+                if (text == "Комплектующие и расходники")
+                {
+                    Data["request_type"] = "consumables";
+                    Step = "consumables_needed";
+                    return "Необходимо: (Ручной ввод)";
+                }
+
+                return "Выберите тип заявки кнопкой: Обычная заявка / Ремонт / Комплектующие и расходники";
 
             case "pilot_type":
                 if (!DroneTypesByPilotType.ContainsKey(text)) return "Выберите тип кнопкой: КТ, Оптика или СТ";
@@ -428,6 +478,11 @@ sealed class SessionState(string step)
                 {
                     Data["coil_km"] = "-";
                 }
+                Step = "note";
+                return "Примечание: (Ручной ввод, по желанию, отправьте - если пусто)";
+
+            case "note":
+                Data["note"] = string.IsNullOrWhiteSpace(text) || text.Trim() == "-" ? "-" : text.Trim();
                 Step = "done";
                 return null;
 
@@ -461,6 +516,23 @@ sealed class SessionState(string step)
                 Step = "done";
                 return null;
 
+            case "consumables_needed":
+                if (string.IsNullOrWhiteSpace(text)) return "Введите, что необходимо:";
+                Data["consumables_needed"] = text.Trim();
+                Step = "consumables_quantity";
+                return "Количество: (Ручной ввод)";
+
+            case "consumables_quantity":
+                if (string.IsNullOrWhiteSpace(text)) return "Введите количество:";
+                Data["consumables_quantity"] = text.Trim();
+                Step = "consumables_note";
+                return "Примечание: (Ручной ввод, по желанию, отправьте - если пусто)";
+
+            case "consumables_note":
+                Data["consumables_note"] = string.IsNullOrWhiteSpace(text) || text.Trim() == "-" ? "-" : text.Trim();
+                Step = "done";
+                return null;
+
             default:
                 return "Ошибка состояния. Нажмите «Оставить заявку» и попробуйте снова.";
         }
@@ -481,8 +553,9 @@ sealed class SessionState(string step)
 
     public bool IsManualInputStep()
     {
-        return Step is "callsign" or "pilot_number" or "rx_firmware" or "regularity_domain" or "bind_phrase" or "quantity"
-            or "repair_equipment" or "repair_fault" or "repair_quantity" or "repair_note";
+        return Step is "callsign" or "pilot_number" or "rx_firmware" or "regularity_domain" or "bind_phrase" or "quantity" or "note"
+            or "repair_equipment" or "repair_fault" or "repair_quantity" or "repair_note"
+            or "consumables_needed" or "consumables_quantity" or "consumables_note";
     }
 
     public string[] DroneOptions()
@@ -499,8 +572,9 @@ sealed class SessionState(string step)
 static class Keyboards
 {
     public static object MainMenu => Keyboard([["Активные заявки", "Завершенные заявки"], ["Оставить заявку"]]);
-    public static object RequestMode => Keyboard([["Обычная заявка", "Ремонт"]]);
+    public static object RequestMode => Keyboard([["Обычная заявка", "Ремонт"], ["Комплектующие и расходники"]]);
     public static object PilotType => Keyboard([["КТ", "Оптика", "СТ"]]);
+    public static object CancelOnly => Keyboard([["Отменить заявку"]]);
     public static object VideoFrequency => Keyboard([["5.8", "3.4", "3.3"], ["1.5", "1.2"]]);
     public static object ControlFrequency => Keyboard([["2.4", "900", "700"], ["500", "300 кузнец"]]);
     public static object RepairUnit => Keyboard([["КТ", "СТ"], ["Оптика", "Мавики"]]);
@@ -514,6 +588,9 @@ static class Keyboards
         "control_frequency" => ControlFrequency,
         "coil_km" => CoilKmByDrone(session),
         "repair_unit" => RepairUnit,
+        "callsign" or "pilot_number" or "rx_firmware" or "regularity_domain" or "bind_phrase" or "quantity"
+            or "repair_equipment" or "repair_fault" or "repair_quantity" or "repair_note"
+            or "consumables_needed" or "consumables_quantity" or "consumables_note" => CancelOnly,
         _ => MainMenu
     };
 
@@ -575,6 +652,7 @@ sealed class ApplicationStore
         "BIND-фраза",
         "Катушка км",
         "Кол-во",
+        "Примечание",
         "Статус"
     ];
 
@@ -609,7 +687,8 @@ sealed class ApplicationStore
             ws.Cell(row, 13).Value = payload.GetValueOrDefault("bind_phrase", "-");
             ws.Cell(row, 14).Value = payload.GetValueOrDefault("coil_km", "-");
             ws.Cell(row, 15).Value = payload["quantity"];
-            ws.Cell(row, 16).Value = StatusActive;
+            ws.Cell(row, 16).Value = payload.GetValueOrDefault("note", "-");
+            ws.Cell(row, 17).Value = StatusActive;
 
             workbook.SaveAs(_excelPath);
             return nextId;
@@ -658,13 +737,13 @@ sealed class ApplicationStore
                     continue;
                 }
 
-                var status = ws.Cell(r, 16).GetString();
+                var status = ws.Cell(r, 17).GetString();
                 if (status != StatusActive)
                 {
                     return false;
                 }
 
-                ws.Cell(r, 16).Value = StatusCompleted;
+                ws.Cell(r, 17).Value = StatusCompleted;
                 ws.Cell(r, 4).Value = DateTime.Now.ToString("s");
                 workbook.SaveAs(_excelPath);
                 return true;
@@ -769,7 +848,8 @@ sealed class ApplicationStore
             BindPhrase: ws.Cell(row, 13).GetString(),
             CoilKm: ws.Cell(row, 14).GetString(),
             Quantity: ws.Cell(row, 15).GetString(),
-            Status: ws.Cell(row, 16).GetString());
+            Note: ws.Cell(row, 16).GetString(),
+            Status: ws.Cell(row, 17).GetString());
     }
 }
 
@@ -971,6 +1051,136 @@ sealed class RepairStore
     }
 }
 
+
+sealed class ConsumablesStore
+{
+    private readonly string _excelPath;
+    private readonly object _sync = new();
+
+    private const string SheetName = "Consumables";
+    private static readonly string[] Headers =
+    [
+        "ID",
+        "Дата запроса",
+        "Запросил",
+        "Необходимо",
+        "Количество",
+        "Примечание"
+    ];
+
+    public ConsumablesStore(string excelPath)
+    {
+        _excelPath = excelPath;
+        Init();
+    }
+
+    public long AddRequest(string reporter, Dictionary<string, string> payload)
+    {
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            var ws = workbook.Worksheet(SheetName);
+
+            var nextId = NextId(ws);
+            var row = ws.LastRowUsed()?.RowNumber() + 1 ?? 2;
+
+            ws.Cell(row, 1).Value = nextId;
+            ws.Cell(row, 2).Value = DateTime.Now.ToString("s");
+            ws.Cell(row, 3).Value = reporter;
+            ws.Cell(row, 4).Value = payload["consumables_needed"];
+            ws.Cell(row, 5).Value = payload["consumables_quantity"];
+            ws.Cell(row, 6).Value = payload.GetValueOrDefault("consumables_note", "-");
+
+            workbook.SaveAs(_excelPath);
+            return nextId;
+        }
+    }
+
+    public ConsumablesItem GetById(long id)
+    {
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            var ws = workbook.Worksheet(SheetName);
+            var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+
+            for (var r = 2; r <= lastRow; r++)
+            {
+                if (long.TryParse(ws.Cell(r, 1).GetString(), out var currentId) && currentId == id)
+                {
+                    return ReadItem(ws, r);
+                }
+            }
+
+            throw new InvalidOperationException($"Заявка на комплектующие {id} не найдена");
+        }
+    }
+
+    private void Init()
+    {
+        lock (_sync)
+        {
+            if (!File.Exists(_excelPath))
+            {
+                using var wb = new XLWorkbook();
+                var ws = wb.Worksheets.Add(SheetName);
+                for (var i = 0; i < Headers.Length; i++)
+                {
+                    ws.Cell(1, i + 1).Value = Headers[i];
+                }
+
+                ws.Range(1, 1, 1, Headers.Length).Style.Font.Bold = true;
+                ws.Columns().AdjustToContents();
+                wb.SaveAs(_excelPath);
+                return;
+            }
+
+            using var existing = new XLWorkbook(_excelPath);
+            if (!existing.TryGetWorksheet(SheetName, out var sheet))
+            {
+                sheet = existing.Worksheets.Add(SheetName);
+            }
+
+            for (var i = 0; i < Headers.Length; i++)
+            {
+                sheet.Cell(1, i + 1).Value = Headers[i];
+            }
+
+            sheet.Range(1, 1, 1, Headers.Length).Style.Font.Bold = true;
+            sheet.Columns().AdjustToContents();
+            existing.SaveAs(_excelPath);
+        }
+    }
+
+    private XLWorkbook OpenWorkbook() => new(_excelPath);
+
+    private static long NextId(IXLWorksheet ws)
+    {
+        var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+        long max = 0;
+        for (var r = 2; r <= lastRow; r++)
+        {
+            if (long.TryParse(ws.Cell(r, 1).GetString(), out var id) && id > max)
+            {
+                max = id;
+            }
+        }
+
+        return max + 1;
+    }
+
+    private static ConsumablesItem ReadItem(IXLWorksheet ws, int row)
+    {
+        return new ConsumablesItem(
+            Id: long.Parse(ws.Cell(row, 1).GetString()),
+            RequestDate: DateTime.Parse(ws.Cell(row, 2).GetString()),
+            RequestedBy: ws.Cell(row, 3).GetString(),
+            Needed: ws.Cell(row, 4).GetString(),
+            Quantity: ws.Cell(row, 5).GetString(),
+            Note: ws.Cell(row, 6).GetString());
+    }
+}
+
 record Application(
     long Id,
     string Reporter,
@@ -987,6 +1197,7 @@ record Application(
     string BindPhrase,
     string CoilKm,
     string Quantity,
+    string Note,
     string Status)
 {
     public string FormatCard()
@@ -1015,6 +1226,7 @@ record Application(
         }
 
         sb.AppendLine($"Количество: {Quantity}");
+        sb.AppendLine($"Примечание: {Note}");
 
         if (Status == ApplicationStore.StatusCompleted && CompletedAt.HasValue)
         {
@@ -1048,6 +1260,27 @@ record RepairItem(
         sb.AppendLine($"Количество: {Quantity}");
         sb.AppendLine($"Примечание: {Note}");
         sb.AppendLine($"Статус: {Status}");
+        return sb.ToString().TrimEnd();
+    }
+}
+
+record ConsumablesItem(
+    long Id,
+    DateTime RequestDate,
+    string RequestedBy,
+    string Needed,
+    string Quantity,
+    string Note)
+{
+    public string FormatCard()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"ID: {Id}");
+        sb.AppendLine($"Дата запроса: {RequestDate:dd.MM HH:mm}");
+        sb.AppendLine($"Запросил: {RequestedBy}");
+        sb.AppendLine($"Необходимо: {Needed}");
+        sb.AppendLine($"Количество: {Quantity}");
+        sb.AppendLine($"Примечание: {Note}");
         return sb.ToString().TrimEnd();
     }
 }
