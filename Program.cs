@@ -39,7 +39,7 @@ sealed record AppSettings(
     HashSet<long> RecommendationNotificationUserIds)
 {
     public static AppSettings Default => new(
-        TablesDirectory: "data",
+        TablesDirectory: "/var/lib/repair_bot/excel",
         ExcelPath: "applications.xlsx",
         RepairExcelPath: "repairs.xlsx",
         ConsumablesExcelPath: "consumables.xlsx",
