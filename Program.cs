@@ -22,7 +22,8 @@ var app = new BotApp(
     settings.CloserIds,
     settings.AccessAdminIds,
     settings.AllowedUserIds,
-    settings.NotificationUserIds);
+    settings.NotificationUserIds,
+    settings.RecommendationNotificationUserIds);
 await app.RunAsync();
 
 sealed record AppSettings(
@@ -34,7 +35,8 @@ sealed record AppSettings(
     HashSet<long> CloserIds,
     HashSet<long> AccessAdminIds,
     HashSet<long> AllowedUserIds,
-    HashSet<long> NotificationUserIds)
+    HashSet<long> NotificationUserIds,
+    HashSet<long> RecommendationNotificationUserIds)
 {
     public static AppSettings Default => new(
         TablesDirectory: "/var/lib/repair_bot/excel",
@@ -45,7 +47,8 @@ sealed record AppSettings(
         CloserIds: [992964625, 7302929200, 191974662],
         AccessAdminIds: [992964625],
         AllowedUserIds: [992964625, 7302929200, 191974662],
-        NotificationUserIds: [992964625, 7302929200, 191974662]
+        NotificationUserIds: [992964625, 7302929200, 191974662],
+        RecommendationNotificationUserIds: [992964625]
     );
 }
 
@@ -68,6 +71,7 @@ sealed class BotApp
     private readonly HashSet<long> _accessAdminIds;
     private readonly HashSet<long> _allowedUserIds;
     private readonly HashSet<long> _notificationUserIds;
+    private readonly HashSet<long> _recommendationNotificationUserIds;
     private readonly Dictionary<long, SessionState> _sessions = new();
     private int _offset;
 
@@ -80,7 +84,8 @@ sealed class BotApp
         HashSet<long> closerIds,
         HashSet<long> accessAdminIds,
         HashSet<long> initialAllowedUserIds,
-        HashSet<long> notificationUserIds)
+        HashSet<long> notificationUserIds,
+        HashSet<long> recommendationNotificationUserIds)
     {
         _token = token;
         _closerIds = closerIds;
@@ -88,12 +93,38 @@ sealed class BotApp
         _store = new ApplicationStore(excelPath);
         _repairStore = new RepairStore(repairExcelPath);
         _consumablesStore = new ConsumablesStore(consumablesExcelPath);
-        _accessStore = new AccessStore(accessExcelPath, initialAllowedUserIds.Concat(accessAdminIds));
+        _accessStore = new AccessStore(accessExcelPath);
         _notificationUserIds = notificationUserIds;
-        _allowedUserIds = _accessStore.GetAllUserIds();
-        foreach (var adminId in _accessAdminIds)
+        _recommendationNotificationUserIds = recommendationNotificationUserIds;
+
+        _accessStore.Bootstrap(initialAllowedUserIds, closerIds, accessAdminIds, notificationUserIds, recommendationNotificationUserIds);
+
+        foreach (var profile in _accessStore.GetUsers())
         {
-            _allowedUserIds.Add(adminId);
+            if (profile.CanUseBot)
+            {
+                _allowedUserIds.Add(profile.UserId);
+            }
+
+            if (profile.CanComplete)
+            {
+                _closerIds.Add(profile.UserId);
+            }
+
+            if (profile.CanManageAccess)
+            {
+                _accessAdminIds.Add(profile.UserId);
+            }
+
+            if (profile.NotifyRequests)
+            {
+                _notificationUserIds.Add(profile.UserId);
+            }
+
+            if (profile.NotifyRecommendations)
+            {
+                _recommendationNotificationUserIds.Add(profile.UserId);
+            }
         }
     }
 
@@ -120,6 +151,7 @@ sealed class BotApp
                     var chatId = message.Chat.Id;
                     var userId = message.From.Id;
                     var reporter = BuildReporter(message.From);
+                    _accessStore.UpdateDisplayName(userId, reporter);
                     var canManageAccess = _accessAdminIds.Contains(userId);
                     var hasAccess = canManageAccess || _allowedUserIds.Contains(userId);
 
@@ -432,9 +464,19 @@ sealed class BotApp
 
             if (text == "Список пользователей")
             {
-                var ids = _accessStore.GetAllUserIds().OrderBy(x => x).ToArray();
-                var list = ids.Length == 0 ? "Список доступа пуст." : "Пользователи с доступом:\n" + string.Join("\n", ids.Select(x => x.ToString()));
-                await SendMessageAsync(chatId, list, Keyboards.AccessManageMenu);
+                var users = _accessStore.GetUsers();
+                if (users.Count == 0)
+                {
+                    await SendMessageAsync(chatId, "Список доступа пуст.", Keyboards.AccessManageMenu);
+                    return true;
+                }
+
+                await SendMessageAsync(chatId, $"Пользователи: {users.Count}", Keyboards.AccessManageMenu);
+                foreach (var user in users)
+                {
+                    await SendMessageAsync(chatId, user.FormatCard(), Keyboards.AccessManageMenu);
+                }
+
                 return true;
             }
 
@@ -455,6 +497,17 @@ sealed class BotApp
 
                 return true;
             }
+
+            if (text == "Выдать доступ") { session.SetStep("access_grant_bot"); await SendMessageAsync(chatId, "Введите Telegram ID:", Keyboards.CancelOnly); return true; }
+            if (text == "Забрать доступ") { session.SetStep("access_revoke_bot"); await SendMessageAsync(chatId, "Введите Telegram ID:", Keyboards.CancelOnly); return true; }
+            if (text == "Выдать завершение") { session.SetStep("access_grant_complete"); await SendMessageAsync(chatId, "Введите Telegram ID:", Keyboards.CancelOnly); return true; }
+            if (text == "Забрать завершение") { session.SetStep("access_revoke_complete"); await SendMessageAsync(chatId, "Введите Telegram ID:", Keyboards.CancelOnly); return true; }
+            if (text == "Выдать управление") { session.SetStep("access_grant_manage"); await SendMessageAsync(chatId, "Введите Telegram ID:", Keyboards.CancelOnly); return true; }
+            if (text == "Забрать управление") { session.SetStep("access_revoke_manage"); await SendMessageAsync(chatId, "Введите Telegram ID:", Keyboards.CancelOnly); return true; }
+            if (text == "Вкл увед. заявок") { session.SetStep("access_enable_req_notify"); await SendMessageAsync(chatId, "Введите Telegram ID:", Keyboards.CancelOnly); return true; }
+            if (text == "Выкл увед. заявок") { session.SetStep("access_disable_req_notify"); await SendMessageAsync(chatId, "Введите Telegram ID:", Keyboards.CancelOnly); return true; }
+            if (text == "Вкл увед. рек.") { session.SetStep("access_enable_rec_notify"); await SendMessageAsync(chatId, "Введите Telegram ID:", Keyboards.CancelOnly); return true; }
+            if (text == "Выкл увед. рек.") { session.SetStep("access_disable_rec_notify"); await SendMessageAsync(chatId, "Введите Telegram ID:", Keyboards.CancelOnly); return true; }
 
             await SendMessageAsync(chatId, "Выберите действие кнопкой.", Keyboards.AccessManageMenu);
             return true;
@@ -507,6 +560,80 @@ sealed class BotApp
             var removed = _accessStore.RemoveUser(removeUserId);
             _allowedUserIds.Remove(removeUserId);
             await SendMessageAsync(chatId, removed ? $"Доступ пользователя {removeUserId} удалён." : $"Пользователь {removeUserId} не найден в списке доступа.", mainMenu);
+            session.SetStep("done");
+            return true;
+        }
+
+        if (session.Step is "access_grant_bot" or "access_revoke_bot" or "access_grant_complete" or "access_revoke_complete" or "access_grant_manage" or "access_revoke_manage" or "access_enable_req_notify" or "access_disable_req_notify" or "access_enable_rec_notify" or "access_disable_rec_notify")
+        {
+            if (!long.TryParse(text, out var targetUserId))
+            {
+                await SendMessageAsync(chatId, "Введите корректный Telegram ID (число).", Keyboards.CancelOnly);
+                return true;
+            }
+
+            switch (session.Step)
+            {
+                case "access_grant_bot":
+                    _accessStore.UpdatePermissions(targetUserId, canUseBot: true);
+                    _allowedUserIds.Add(targetUserId);
+                    await SendMessageAsync(chatId, $"Доступ к боту выдан: {targetUserId}", mainMenu);
+                    break;
+                case "access_revoke_bot":
+                    _accessStore.UpdatePermissions(targetUserId, canUseBot: false, canComplete: false, canManageAccess: false, notifyRequests: false, notifyRecommendations: false);
+                    _allowedUserIds.Remove(targetUserId);
+                    _closerIds.Remove(targetUserId);
+                    _accessAdminIds.Remove(targetUserId);
+                    _notificationUserIds.Remove(targetUserId);
+                    _recommendationNotificationUserIds.Remove(targetUserId);
+                    await SendMessageAsync(chatId, $"Доступ к боту снят: {targetUserId}", mainMenu);
+                    break;
+                case "access_grant_complete":
+                    _accessStore.UpdatePermissions(targetUserId, canUseBot: true, canComplete: true);
+                    _allowedUserIds.Add(targetUserId);
+                    _closerIds.Add(targetUserId);
+                    await SendMessageAsync(chatId, $"Права завершения выданы: {targetUserId}", mainMenu);
+                    break;
+                case "access_revoke_complete":
+                    _accessStore.UpdatePermissions(targetUserId, canComplete: false);
+                    _closerIds.Remove(targetUserId);
+                    await SendMessageAsync(chatId, $"Права завершения сняты: {targetUserId}", mainMenu);
+                    break;
+                case "access_grant_manage":
+                    _accessStore.UpdatePermissions(targetUserId, canUseBot: true, canManageAccess: true);
+                    _allowedUserIds.Add(targetUserId);
+                    _accessAdminIds.Add(targetUserId);
+                    await SendMessageAsync(chatId, $"Права управления доступом выданы: {targetUserId}", mainMenu);
+                    break;
+                case "access_revoke_manage":
+                    _accessStore.UpdatePermissions(targetUserId, canManageAccess: false);
+                    _accessAdminIds.Remove(targetUserId);
+                    await SendMessageAsync(chatId, $"Права управления доступом сняты: {targetUserId}", mainMenu);
+                    break;
+                case "access_enable_req_notify":
+                    _accessStore.UpdatePermissions(targetUserId, canUseBot: true, notifyRequests: true);
+                    _allowedUserIds.Add(targetUserId);
+                    _notificationUserIds.Add(targetUserId);
+                    await SendMessageAsync(chatId, $"Уведомления о заявках включены: {targetUserId}", mainMenu);
+                    break;
+                case "access_disable_req_notify":
+                    _accessStore.UpdatePermissions(targetUserId, notifyRequests: false);
+                    _notificationUserIds.Remove(targetUserId);
+                    await SendMessageAsync(chatId, $"Уведомления о заявках выключены: {targetUserId}", mainMenu);
+                    break;
+                case "access_enable_rec_notify":
+                    _accessStore.UpdatePermissions(targetUserId, canUseBot: true, notifyRecommendations: true);
+                    _allowedUserIds.Add(targetUserId);
+                    _recommendationNotificationUserIds.Add(targetUserId);
+                    await SendMessageAsync(chatId, $"Уведомления о рекомендациях включены: {targetUserId}", mainMenu);
+                    break;
+                default:
+                    _accessStore.UpdatePermissions(targetUserId, notifyRecommendations: false);
+                    _recommendationNotificationUserIds.Remove(targetUserId);
+                    await SendMessageAsync(chatId, $"Уведомления о рекомендациях выключены: {targetUserId}", mainMenu);
+                    break;
+            }
+
             session.SetStep("done");
             return true;
         }
@@ -576,7 +703,9 @@ sealed class BotApp
     {
         return text is "/start" or "Меню" or "Оставить заявку" or "Активные заявки" or "Завершенные заявки"
             or "Завершить заявку" or "Заявки на дроны" or "Заявки на ремонт" or "Заявки на комлектующие" or "Заявки на комплектующие"
-            or "Управление доступом" or "Добавить пользователя" or "Удалить пользователя" or "Список пользователей" or "Рекомендации" or "Рекомендовать пользователя";
+            or "Управление доступом" or "Добавить пользователя" or "Удалить пользователя" or "Список пользователей" or "Рекомендации" or "Рекомендовать пользователя"
+            or "Выдать доступ" or "Забрать доступ" or "Выдать завершение" or "Забрать завершение" or "Выдать управление" or "Забрать управление"
+            or "Вкл увед. заявок" or "Выкл увед. заявок" or "Вкл увед. рек." or "Выкл увед. рек.";
     }
 
     private static string BuildReporter(User user)
@@ -611,7 +740,7 @@ sealed class BotApp
 
     private async Task NotifyRecommendationAsync(string message)
     {
-        foreach (var adminUserId in _accessAdminIds)
+        foreach (var adminUserId in _recommendationNotificationUserIds)
         {
             try
             {
@@ -895,7 +1024,11 @@ sealed class SessionState(string step)
         return Step is "callsign" or "pilot_number" or "rx_firmware" or "regularity_domain" or "bind_phrase" or "quantity" or "note"
             or "repair_equipment" or "repair_fault" or "repair_quantity" or "repair_note"
             or "consumables_needed" or "consumables_quantity" or "consumables_note"
-            or "access_add_user" or "access_remove_user" or "recommend_user_id" or "recommend_note";
+            or "access_add_user" or "access_remove_user"
+            or "access_grant_bot" or "access_revoke_bot" or "access_grant_complete" or "access_revoke_complete"
+            or "access_grant_manage" or "access_revoke_manage" or "access_enable_req_notify" or "access_disable_req_notify"
+            or "access_enable_rec_notify" or "access_disable_rec_notify"
+            or "recommend_user_id" or "recommend_note";
     }
 
     public string[] DroneOptions()
@@ -940,7 +1073,7 @@ static class Keyboards
     public static object NoAccess => Keyboard([["/start"]]);
     public static object CategoryMenu => Keyboard([["Заявки на дроны"], ["Заявки на ремонт"], ["Заявки на комлектующие"]]);
     public static object RequestMode => Keyboard([["Обычная заявка", "Ремонт"], ["Комплектующие и расходники"]]);
-    public static object AccessManageMenu => Keyboard([["Добавить пользователя", "Удалить пользователя"], ["Список пользователей", "Рекомендации"], ["Отменить заявку"]]);
+    public static object AccessManageMenu => Keyboard([["Добавить пользователя", "Удалить пользователя"], ["Выдать доступ", "Забрать доступ"], ["Выдать завершение", "Забрать завершение"], ["Выдать управление", "Забрать управление"], ["Вкл увед. заявок", "Выкл увед. заявок"], ["Вкл увед. рек.", "Выкл увед. рек."], ["Список пользователей", "Рекомендации"], ["Отменить заявку"]]);
     public static object PilotType => Keyboard([["КТ", "Оптика", "СТ"]]);
     public static object CancelOnly => Keyboard([["Отменить заявку"]]);
     public static object VideoFrequency => Keyboard([["5.8", "3.4", "3.3"], ["1.5", "1.2"]]);
@@ -961,7 +1094,11 @@ static class Keyboards
         "callsign" or "pilot_number" or "rx_firmware" or "regularity_domain" or "bind_phrase" or "quantity"
             or "repair_equipment" or "repair_fault" or "repair_quantity" or "repair_note"
             or "consumables_needed" or "consumables_quantity" or "consumables_note"
-            or "access_add_user" or "access_remove_user" or "recommend_user_id" or "recommend_note" => CancelOnly,
+            or "access_add_user" or "access_remove_user"
+            or "access_grant_bot" or "access_revoke_bot" or "access_grant_complete" or "access_revoke_complete"
+            or "access_grant_manage" or "access_revoke_manage" or "access_enable_req_notify" or "access_disable_req_notify"
+            or "access_enable_rec_notify" or "access_disable_rec_notify"
+            or "recommend_user_id" or "recommend_note" => CancelOnly,
         "access_manage_menu" => AccessManageMenu,
         _ => MainMenu(false, false, false)
     };
@@ -1155,6 +1292,22 @@ sealed class ApplicationStore
 
             throw new InvalidOperationException($"Заявка {appId} не найдена");
         }
+    }
+
+    private static int FindOrCreateRow(IXLWorksheet ws, long userId)
+    {
+        var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+        for (var r = 2; r <= lastRow; r++)
+        {
+            if (long.TryParse(ws.Cell(r, 1).GetString(), out var existingId) && existingId == userId)
+            {
+                return r;
+            }
+        }
+
+        var row = lastRow + 1;
+        ws.Cell(row, 1).Value = userId;
+        return row;
     }
 
     private void Init()
@@ -1367,6 +1520,22 @@ sealed class RepairStore
         }
     }
 
+    private static int FindOrCreateRow(IXLWorksheet ws, long userId)
+    {
+        var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+        for (var r = 2; r <= lastRow; r++)
+        {
+            if (long.TryParse(ws.Cell(r, 1).GetString(), out var existingId) && existingId == userId)
+            {
+                return r;
+            }
+        }
+
+        var row = lastRow + 1;
+        ws.Cell(row, 1).Value = userId;
+        return row;
+    }
+
     private void Init()
     {
         lock (_sync)
@@ -1564,6 +1733,22 @@ sealed class ConsumablesStore
         }
     }
 
+    private static int FindOrCreateRow(IXLWorksheet ws, long userId)
+    {
+        var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+        for (var r = 2; r <= lastRow; r++)
+        {
+            if (long.TryParse(ws.Cell(r, 1).GetString(), out var existingId) && existingId == userId)
+            {
+                return r;
+            }
+        }
+
+        var row = lastRow + 1;
+        ws.Cell(row, 1).Value = userId;
+        return row;
+    }
+
     private void Init()
     {
         lock (_sync)
@@ -1639,84 +1824,127 @@ sealed class AccessStore
 
     private const string SheetName = "Users";
     private const string RecommendationSheetName = "Recommendations";
-    private static readonly string[] Headers = ["UserId", "AddedAt"];
+    private static readonly string[] Headers = ["UserId", "DisplayName", "CanUseBot", "CanComplete", "CanManageAccess", "NotifyRequests", "NotifyRecommendations", "AddedAt"];
     private static readonly string[] RecommendationHeaders = ["ID", "Дата", "Рекомендовал", "Кандидат ID", "Комментарий"];
 
-    public AccessStore(string excelPath, IEnumerable<long> seedUserIds)
+    public AccessStore(string excelPath)
     {
         _excelPath = excelPath;
         Init();
-
-        foreach (var userId in seedUserIds.Distinct())
-        {
-            AddUser(userId);
-        }
     }
 
-    public HashSet<long> GetAllUserIds()
+    public List<UserAccessEntry> GetUsers()
     {
         lock (_sync)
         {
             using var workbook = OpenWorkbook();
             var ws = workbook.Worksheet(SheetName);
-            var result = new HashSet<long>();
+            var result = new List<UserAccessEntry>();
             var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
             for (var r = 2; r <= lastRow; r++)
             {
-                if (long.TryParse(ws.Cell(r, 1).GetString(), out var userId))
+                if (!long.TryParse(ws.Cell(r, 1).GetString(), out var userId))
                 {
-                    result.Add(userId);
+                    continue;
                 }
+
+                result.Add(new UserAccessEntry(
+                    UserId: userId,
+                    DisplayName: string.IsNullOrWhiteSpace(ws.Cell(r, 2).GetString()) ? "-" : ws.Cell(r, 2).GetString(),
+                    CanUseBot: ws.Cell(r, 3).GetString() == "1",
+                    CanComplete: ws.Cell(r, 4).GetString() == "1",
+                    CanManageAccess: ws.Cell(r, 5).GetString() == "1",
+                    NotifyRequests: ws.Cell(r, 6).GetString() == "1",
+                    NotifyRecommendations: ws.Cell(r, 7).GetString() == "1"));
             }
 
-            return result;
+            return result.OrderBy(x => x.UserId).ToList();
+        }
+    }
+
+    public HashSet<long> GetAllUserIds() => GetUsers().Where(x => x.CanUseBot).Select(x => x.UserId).ToHashSet();
+
+    public void Bootstrap(IEnumerable<long> allowed, IEnumerable<long> closers, IEnumerable<long> managers, IEnumerable<long> requestNotify, IEnumerable<long> recommendationNotify)
+    {
+        foreach (var id in allowed.Distinct())
+        {
+            UpdatePermissions(id, canUseBot: true);
+        }
+
+        foreach (var id in closers.Distinct())
+        {
+            UpdatePermissions(id, canUseBot: true, canComplete: true);
+        }
+
+        foreach (var id in managers.Distinct())
+        {
+            UpdatePermissions(id, canUseBot: true, canManageAccess: true);
+        }
+
+        foreach (var id in requestNotify.Distinct())
+        {
+            UpdatePermissions(id, canUseBot: true, notifyRequests: true);
+        }
+
+        foreach (var id in recommendationNotify.Distinct())
+        {
+            UpdatePermissions(id, canUseBot: true, notifyRecommendations: true);
+        }
+    }
+
+    public void UpdateDisplayName(long userId, string displayName)
+    {
+        if (string.IsNullOrWhiteSpace(displayName))
+        {
+            return;
+        }
+
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            var ws = workbook.Worksheet(SheetName);
+            var row = FindOrCreateRow(ws, userId);
+            ws.Cell(row, 2).Value = displayName.Trim();
+            workbook.SaveAs(_excelPath);
+        }
+    }
+
+    public void UpdatePermissions(long userId, bool? canUseBot = null, bool? canComplete = null, bool? canManageAccess = null, bool? notifyRequests = null, bool? notifyRecommendations = null)
+    {
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            var ws = workbook.Worksheet(SheetName);
+            var row = FindOrCreateRow(ws, userId);
+
+            if (string.IsNullOrWhiteSpace(ws.Cell(row, 2).GetString()))
+            {
+                ws.Cell(row, 2).Value = "-";
+            }
+
+            if (canUseBot.HasValue) ws.Cell(row, 3).Value = canUseBot.Value ? "1" : "0";
+            if (canComplete.HasValue) ws.Cell(row, 4).Value = canComplete.Value ? "1" : "0";
+            if (canManageAccess.HasValue) ws.Cell(row, 5).Value = canManageAccess.Value ? "1" : "0";
+            if (notifyRequests.HasValue) ws.Cell(row, 6).Value = notifyRequests.Value ? "1" : "0";
+            if (notifyRecommendations.HasValue) ws.Cell(row, 7).Value = notifyRecommendations.Value ? "1" : "0";
+            if (string.IsNullOrWhiteSpace(ws.Cell(row, 8).GetString())) ws.Cell(row, 8).Value = DateTime.Now.ToString("s");
+
+            workbook.SaveAs(_excelPath);
         }
     }
 
     public bool AddUser(long userId)
     {
-        lock (_sync)
-        {
-            using var workbook = OpenWorkbook();
-            var ws = workbook.Worksheet(SheetName);
-            var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
-
-            for (var r = 2; r <= lastRow; r++)
-            {
-                if (long.TryParse(ws.Cell(r, 1).GetString(), out var existingUserId) && existingUserId == userId)
-                {
-                    return false;
-                }
-            }
-
-            var row = lastRow + 1;
-            ws.Cell(row, 1).Value = userId;
-            ws.Cell(row, 2).Value = DateTime.Now.ToString("s");
-            workbook.SaveAs(_excelPath);
-            return true;
-        }
+        var existed = GetUsers().Any(x => x.UserId == userId);
+        UpdatePermissions(userId, canUseBot: true);
+        return !existed;
     }
 
     public bool RemoveUser(long userId)
     {
-        lock (_sync)
-        {
-            using var workbook = OpenWorkbook();
-            var ws = workbook.Worksheet(SheetName);
-            var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
-
-            for (var r = 2; r <= lastRow; r++)
-            {
-                if (long.TryParse(ws.Cell(r, 1).GetString(), out var existingUserId) && existingUserId == userId)
-                {
-                    ws.Row(r).Delete();
-                    workbook.SaveAs(_excelPath);
-                    return true;
-                }
-            }
-
-            return false;
-        }
+        var existed = GetUsers().Any(x => x.UserId == userId);
+        UpdatePermissions(userId, canUseBot: false, canComplete: false, canManageAccess: false, notifyRequests: false, notifyRecommendations: false);
+        return existed;
     }
 
     public long AddRecommendation(string recommender, long recommendedUserId, string note)
@@ -1780,6 +2008,22 @@ sealed class AccessStore
         return max + 1;
     }
 
+    private static int FindOrCreateRow(IXLWorksheet ws, long userId)
+    {
+        var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+        for (var r = 2; r <= lastRow; r++)
+        {
+            if (long.TryParse(ws.Cell(r, 1).GetString(), out var existingId) && existingId == userId)
+            {
+                return r;
+            }
+        }
+
+        var row = lastRow + 1;
+        ws.Cell(row, 1).Value = userId;
+        return row;
+    }
+
     private void Init()
     {
         lock (_sync)
@@ -1796,14 +2040,14 @@ sealed class AccessStore
                 ws.Range(1, 1, 1, Headers.Length).Style.Font.Bold = true;
                 ws.Columns().AdjustToContents();
 
-                var recommendationSheet = wb.Worksheets.Add(RecommendationSheetName);
+                var recommendationSheetNew = wb.Worksheets.Add(RecommendationSheetName);
                 for (var i = 0; i < RecommendationHeaders.Length; i++)
                 {
-                    recommendationSheet.Cell(1, i + 1).Value = RecommendationHeaders[i];
+                    recommendationSheetNew.Cell(1, i + 1).Value = RecommendationHeaders[i];
                 }
 
-                recommendationSheet.Range(1, 1, 1, RecommendationHeaders.Length).Style.Font.Bold = true;
-                recommendationSheet.Columns().AdjustToContents();
+                recommendationSheetNew.Range(1, 1, 1, RecommendationHeaders.Length).Style.Font.Bold = true;
+                recommendationSheetNew.Columns().AdjustToContents();
                 wb.SaveAs(_excelPath);
                 return;
             }
@@ -1839,6 +2083,29 @@ sealed class AccessStore
     }
 
     private XLWorkbook OpenWorkbook() => new(_excelPath);
+}
+
+record UserAccessEntry(
+    long UserId,
+    string DisplayName,
+    bool CanUseBot,
+    bool CanComplete,
+    bool CanManageAccess,
+    bool NotifyRequests,
+    bool NotifyRecommendations)
+{
+    public string FormatCard()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"ID: {UserId}");
+        sb.AppendLine($"Юзернейм: {DisplayName}");
+        sb.AppendLine($"Доступ к боту: {(CanUseBot ? "Да" : "Нет")}");
+        sb.AppendLine($"Завершение заявок: {(CanComplete ? "Да" : "Нет")}");
+        sb.AppendLine($"Управление доступом: {(CanManageAccess ? "Да" : "Нет")}");
+        sb.AppendLine($"Уведомления о заявках: {(NotifyRequests ? "Да" : "Нет")}");
+        sb.AppendLine($"Уведомления о рекомендациях: {(NotifyRecommendations ? "Да" : "Нет")}");
+        return sb.ToString().TrimEnd();
+    }
 }
 
 record UserRecommendation(
