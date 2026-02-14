@@ -21,7 +21,8 @@ var app = new BotApp(
     Path.Combine(tablesDir, settings.AccessExcelPath),
     settings.CloserIds,
     settings.AccessAdminIds,
-    settings.AllowedUserIds);
+    settings.AllowedUserIds,
+    settings.NotificationUserIds);
 await app.RunAsync();
 
 sealed record AppSettings(
@@ -32,7 +33,8 @@ sealed record AppSettings(
     string AccessExcelPath,
     HashSet<long> CloserIds,
     HashSet<long> AccessAdminIds,
-    HashSet<long> AllowedUserIds)
+    HashSet<long> AllowedUserIds,
+    HashSet<long> NotificationUserIds)
 {
     public static AppSettings Default => new(
         TablesDirectory: "/var/lib/repair_bot/excel",
@@ -40,9 +42,10 @@ sealed record AppSettings(
         RepairExcelPath: "repairs.xlsx",
         ConsumablesExcelPath: "consumables.xlsx",
         AccessExcelPath: "access_users.xlsx",
-        CloserIds: [992964625, 222222222],
+        CloserIds: [992964625, 7302929200, 191974662],
         AccessAdminIds: [992964625],
-        AllowedUserIds: [992964625, 222222222]
+        AllowedUserIds: [992964625, 7302929200, 191974662],
+        NotificationUserIds: [992964625, 7302929200, 191974662]
     );
 }
 
@@ -64,6 +67,7 @@ sealed class BotApp
     private readonly HashSet<long> _closerIds;
     private readonly HashSet<long> _accessAdminIds;
     private readonly HashSet<long> _allowedUserIds;
+    private readonly HashSet<long> _notificationUserIds;
     private readonly Dictionary<long, SessionState> _sessions = new();
     private int _offset;
 
@@ -75,7 +79,8 @@ sealed class BotApp
         string accessExcelPath,
         HashSet<long> closerIds,
         HashSet<long> accessAdminIds,
-        HashSet<long> initialAllowedUserIds)
+        HashSet<long> initialAllowedUserIds,
+        HashSet<long> notificationUserIds)
     {
         _token = token;
         _closerIds = closerIds;
@@ -84,6 +89,7 @@ sealed class BotApp
         _repairStore = new RepairStore(repairExcelPath);
         _consumablesStore = new ConsumablesStore(consumablesExcelPath);
         _accessStore = new AccessStore(accessExcelPath, initialAllowedUserIds.Concat(accessAdminIds));
+        _notificationUserIds = notificationUserIds;
         _allowedUserIds = _accessStore.GetAllUserIds();
         foreach (var adminId in _accessAdminIds)
         {
@@ -125,7 +131,7 @@ sealed class BotApp
                     }
 
                     var canComplete = _closerIds.Contains(userId);
-                    var mainMenu = Keyboards.MainMenu(canComplete, canManageAccess);
+                    var mainMenu = Keyboards.MainMenu(canComplete, canManageAccess, true);
 
                     if (text == "Отменить заявку")
                     {
@@ -216,6 +222,15 @@ sealed class BotApp
                         continue;
                     }
 
+                    if (text == "Рекомендовать пользователя")
+                    {
+                        var recommendationSession = new SessionState("recommend_user_id");
+                        recommendationSession.Data["recommender"] = reporter;
+                        _sessions[userId] = recommendationSession;
+                        await SendMessageAsync(chatId, "Введите Telegram ID пользователя, которого хотите рекомендовать:", Keyboards.CancelOnly);
+                        continue;
+                    }
+
                     if (!_sessions.TryGetValue(userId, out var session))
                     {
                         await SendMessageAsync(chatId, "Не понял команду. Нажмите /start", mainMenu);
@@ -231,18 +246,21 @@ sealed class BotApp
                             var repairId = _repairStore.AddRepair(reporter, session.Data);
                             var repair = _repairStore.GetById(repairId);
                             await SendMessageAsync(chatId, $"Заявка на ремонт создана!\n\n{repair.FormatCard()}", mainMenu);
+                            await NotifyNewRequestAsync($"Новая заявка на ремонт #{repair.Id} от {repair.Reporter}");
                         }
                         else if (session.IsConsumablesRequest)
                         {
                             var consumablesId = _consumablesStore.AddRequest(reporter, session.Data);
                             var consumables = _consumablesStore.GetById(consumablesId);
                             await SendMessageAsync(chatId, $"Заявка на комплектующие создана!\n\n{consumables.FormatCard()}", mainMenu);
+                            await NotifyNewRequestAsync($"Новая заявка на комплектующие #{consumables.Id} от {consumables.RequestedBy}");
                         }
                         else
                         {
                             var appId = _store.AddApplication(reporter, session.Data);
                             var appModel = _store.GetById(appId);
                             await SendMessageAsync(chatId, $"Заявка создана!\n\n{appModel.FormatCard()}", mainMenu);
+                            await NotifyNewRequestAsync($"Новая заявка на дроны #{appModel.Id} от {appModel.Reporter}");
                         }
                     }
                     else
@@ -420,6 +438,24 @@ sealed class BotApp
                 return true;
             }
 
+            if (text == "Рекомендации")
+            {
+                var recommendations = _accessStore.GetRecommendations();
+                if (recommendations.Count == 0)
+                {
+                    await SendMessageAsync(chatId, "Рекомендаций пока нет.", Keyboards.AccessManageMenu);
+                    return true;
+                }
+
+                await SendMessageAsync(chatId, $"Рекомендации: {recommendations.Count}", Keyboards.AccessManageMenu);
+                foreach (var recommendation in recommendations)
+                {
+                    await SendMessageAsync(chatId, recommendation.FormatCard(), Keyboards.AccessManageMenu);
+                }
+
+                return true;
+            }
+
             await SendMessageAsync(chatId, "Выберите действие кнопкой.", Keyboards.AccessManageMenu);
             return true;
         }
@@ -475,6 +511,33 @@ sealed class BotApp
             return true;
         }
 
+        if (session.Step == "recommend_user_id")
+        {
+            if (!long.TryParse(text, out var recommendedUserId))
+            {
+                await SendMessageAsync(chatId, "Введите корректный Telegram ID (число).", Keyboards.CancelOnly);
+                return true;
+            }
+
+            session.Data["recommended_user_id"] = recommendedUserId.ToString();
+            session.SetStep("recommend_note");
+            await SendMessageAsync(chatId, "Добавьте комментарий (по желанию, отправьте - если без комментария):", Keyboards.CancelOnly);
+            return true;
+        }
+
+        if (session.Step == "recommend_note")
+        {
+            var note = string.IsNullOrWhiteSpace(text) || text.Trim() == "-" ? "-" : text.Trim();
+            var recommender = session.Data.GetValueOrDefault("recommender", "Неизвестно");
+            var recommendedId = long.Parse(session.Data["recommended_user_id"]);
+            var recommendationId = _accessStore.AddRecommendation(recommender, recommendedId, note);
+
+            await SendMessageAsync(chatId, $"Рекомендация #{recommendationId} отправлена на рассмотрение.", mainMenu);
+            await NotifyRecommendationAsync($"Новая рекомендация #{recommendationId}\nРекомендовал: {recommender}\nКандидат ID: {recommendedId}\nКомментарий: {note}");
+            session.SetStep("done");
+            return true;
+        }
+
         return false;
     }
 
@@ -513,7 +576,7 @@ sealed class BotApp
     {
         return text is "/start" or "Меню" or "Оставить заявку" or "Активные заявки" or "Завершенные заявки"
             or "Завершить заявку" or "Заявки на дроны" or "Заявки на ремонт" or "Заявки на комлектующие" or "Заявки на комплектующие"
-            or "Управление доступом" or "Добавить пользователя" or "Удалить пользователя" or "Список пользователей";
+            or "Управление доступом" or "Добавить пользователя" or "Удалить пользователя" or "Список пользователей" or "Рекомендации" or "Рекомендовать пользователя";
     }
 
     private static string BuildReporter(User user)
@@ -529,6 +592,36 @@ sealed class BotApp
         return string.IsNullOrWhiteSpace(displayName)
             ? $"tg://user?id={user.Id}"
             : $"{displayName} (tg://user?id={user.Id})";
+    }
+
+    private async Task NotifyNewRequestAsync(string message)
+    {
+        foreach (var notifyUserId in _notificationUserIds)
+        {
+            try
+            {
+                await SendMessageAsync(notifyUserId, message, Keyboards.MainMenu(_closerIds.Contains(notifyUserId), _accessAdminIds.Contains(notifyUserId), true));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Не удалось отправить уведомление {notifyUserId}: {ex.Message}");
+            }
+        }
+    }
+
+    private async Task NotifyRecommendationAsync(string message)
+    {
+        foreach (var adminUserId in _accessAdminIds)
+        {
+            try
+            {
+                await SendMessageAsync(adminUserId, message, Keyboards.MainMenu(_closerIds.Contains(adminUserId), _accessAdminIds.Contains(adminUserId), true));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Не удалось отправить рекомендацию {adminUserId}: {ex.Message}");
+            }
+        }
     }
 
     private async Task<List<Update>> GetUpdatesAsync()
@@ -802,7 +895,7 @@ sealed class SessionState(string step)
         return Step is "callsign" or "pilot_number" or "rx_firmware" or "regularity_domain" or "bind_phrase" or "quantity" or "note"
             or "repair_equipment" or "repair_fault" or "repair_quantity" or "repair_note"
             or "consumables_needed" or "consumables_quantity" or "consumables_note"
-            or "access_add_user" or "access_remove_user";
+            or "access_add_user" or "access_remove_user" or "recommend_user_id" or "recommend_note";
     }
 
     public string[] DroneOptions()
@@ -818,7 +911,7 @@ sealed class SessionState(string step)
 
 static class Keyboards
 {
-    public static object MainMenu(bool canComplete, bool canManageAccess)
+    public static object MainMenu(bool canComplete, bool canManageAccess, bool canRecommend)
     {
         var rows = new List<string[]>
         {
@@ -836,13 +929,18 @@ static class Keyboards
             rows.Add(new[] { "Управление доступом" });
         }
 
+        if (canRecommend)
+        {
+            rows.Add(new[] { "Рекомендовать пользователя" });
+        }
+
         return Keyboard(rows.ToArray());
     }
 
     public static object NoAccess => Keyboard([["/start"]]);
     public static object CategoryMenu => Keyboard([["Заявки на дроны"], ["Заявки на ремонт"], ["Заявки на комлектующие"]]);
     public static object RequestMode => Keyboard([["Обычная заявка", "Ремонт"], ["Комплектующие и расходники"]]);
-    public static object AccessManageMenu => Keyboard([["Добавить пользователя", "Удалить пользователя"], ["Список пользователей"], ["Отменить заявку"]]);
+    public static object AccessManageMenu => Keyboard([["Добавить пользователя", "Удалить пользователя"], ["Список пользователей", "Рекомендации"], ["Отменить заявку"]]);
     public static object PilotType => Keyboard([["КТ", "Оптика", "СТ"]]);
     public static object CancelOnly => Keyboard([["Отменить заявку"]]);
     public static object VideoFrequency => Keyboard([["5.8", "3.4", "3.3"], ["1.5", "1.2"]]);
@@ -863,15 +961,15 @@ static class Keyboards
         "callsign" or "pilot_number" or "rx_firmware" or "regularity_domain" or "bind_phrase" or "quantity"
             or "repair_equipment" or "repair_fault" or "repair_quantity" or "repair_note"
             or "consumables_needed" or "consumables_quantity" or "consumables_note"
-            or "access_add_user" or "access_remove_user" => CancelOnly,
+            or "access_add_user" or "access_remove_user" or "recommend_user_id" or "recommend_note" => CancelOnly,
         "access_manage_menu" => AccessManageMenu,
-        _ => MainMenu(false, false)
+        _ => MainMenu(false, false, false)
     };
 
     private static object DroneType(SessionState? session)
     {
         var options = session?.DroneOptions() ?? [];
-        if (options.Length == 0) return MainMenu(false, false);
+        if (options.Length == 0) return MainMenu(false, false, false);
 
         var rows = options
             .Chunk(2)
@@ -884,7 +982,7 @@ static class Keyboards
     private static object CoilKmByDrone(SessionState? session)
     {
         var options = session?.CoilOptions() ?? [];
-        if (options.Length == 0) return MainMenu(false, false);
+        if (options.Length == 0) return MainMenu(false, false, false);
 
         return Keyboard([options]);
     }
@@ -1540,7 +1638,9 @@ sealed class AccessStore
     private readonly object _sync = new();
 
     private const string SheetName = "Users";
+    private const string RecommendationSheetName = "Recommendations";
     private static readonly string[] Headers = ["UserId", "AddedAt"];
+    private static readonly string[] RecommendationHeaders = ["ID", "Дата", "Рекомендовал", "Кандидат ID", "Комментарий"];
 
     public AccessStore(string excelPath, IEnumerable<long> seedUserIds)
     {
@@ -1619,6 +1719,67 @@ sealed class AccessStore
         }
     }
 
+    public long AddRecommendation(string recommender, long recommendedUserId, string note)
+    {
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            var ws = workbook.Worksheet(RecommendationSheetName);
+            var nextId = NextRecommendationId(ws);
+            var row = ws.LastRowUsed()?.RowNumber() + 1 ?? 2;
+            ws.Cell(row, 1).Value = nextId;
+            ws.Cell(row, 2).Value = DateTime.Now.ToString("s");
+            ws.Cell(row, 3).Value = recommender;
+            ws.Cell(row, 4).Value = recommendedUserId;
+            ws.Cell(row, 5).Value = note;
+            workbook.SaveAs(_excelPath);
+            return nextId;
+        }
+    }
+
+    public List<UserRecommendation> GetRecommendations()
+    {
+        lock (_sync)
+        {
+            using var workbook = OpenWorkbook();
+            var ws = workbook.Worksheet(RecommendationSheetName);
+            var result = new List<UserRecommendation>();
+
+            var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+            for (var r = 2; r <= lastRow; r++)
+            {
+                if (ws.Cell(r, 1).IsEmpty())
+                {
+                    continue;
+                }
+
+                result.Add(new UserRecommendation(
+                    Id: long.Parse(ws.Cell(r, 1).GetString()),
+                    CreatedAt: DateTime.Parse(ws.Cell(r, 2).GetString()),
+                    Recommender: ws.Cell(r, 3).GetString(),
+                    RecommendedUserId: long.Parse(ws.Cell(r, 4).GetString()),
+                    Note: ws.Cell(r, 5).GetString()));
+            }
+
+            return result.OrderByDescending(x => x.Id).ToList();
+        }
+    }
+
+    private static long NextRecommendationId(IXLWorksheet ws)
+    {
+        var lastRow = ws.LastRowUsed()?.RowNumber() ?? 1;
+        long max = 0;
+        for (var r = 2; r <= lastRow; r++)
+        {
+            if (long.TryParse(ws.Cell(r, 1).GetString(), out var id) && id > max)
+            {
+                max = id;
+            }
+        }
+
+        return max + 1;
+    }
+
     private void Init()
     {
         lock (_sync)
@@ -1634,6 +1795,15 @@ sealed class AccessStore
 
                 ws.Range(1, 1, 1, Headers.Length).Style.Font.Bold = true;
                 ws.Columns().AdjustToContents();
+
+                var recommendationSheet = wb.Worksheets.Add(RecommendationSheetName);
+                for (var i = 0; i < RecommendationHeaders.Length; i++)
+                {
+                    recommendationSheet.Cell(1, i + 1).Value = RecommendationHeaders[i];
+                }
+
+                recommendationSheet.Range(1, 1, 1, RecommendationHeaders.Length).Style.Font.Bold = true;
+                recommendationSheet.Columns().AdjustToContents();
                 wb.SaveAs(_excelPath);
                 return;
             }
@@ -1651,11 +1821,43 @@ sealed class AccessStore
 
             sheet.Range(1, 1, 1, Headers.Length).Style.Font.Bold = true;
             sheet.Columns().AdjustToContents();
+
+            if (!existing.TryGetWorksheet(RecommendationSheetName, out var recommendationSheet))
+            {
+                recommendationSheet = existing.Worksheets.Add(RecommendationSheetName);
+            }
+
+            for (var i = 0; i < RecommendationHeaders.Length; i++)
+            {
+                recommendationSheet.Cell(1, i + 1).Value = RecommendationHeaders[i];
+            }
+
+            recommendationSheet.Range(1, 1, 1, RecommendationHeaders.Length).Style.Font.Bold = true;
+            recommendationSheet.Columns().AdjustToContents();
             existing.SaveAs(_excelPath);
         }
     }
 
     private XLWorkbook OpenWorkbook() => new(_excelPath);
+}
+
+record UserRecommendation(
+    long Id,
+    DateTime CreatedAt,
+    string Recommender,
+    long RecommendedUserId,
+    string Note)
+{
+    public string FormatCard()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"ID: {Id}");
+        sb.AppendLine($"Дата: {CreatedAt:dd.MM HH:mm}");
+        sb.AppendLine($"Рекомендовал: {Recommender}");
+        sb.AppendLine($"Кандидат ID: {RecommendedUserId}");
+        sb.AppendLine($"Комментарий: {Note}");
+        return sb.ToString().TrimEnd();
+    }
 }
 
 record Application(
